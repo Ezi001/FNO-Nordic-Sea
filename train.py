@@ -1,4 +1,3 @@
-# Required libraries
 """
 Name: Esther Zijerveld
 Training a FNO on the North sea data
@@ -10,52 +9,69 @@ Training a FNO on the North sea data
 5. Evaluating predictions
 """
 #Import dependencies
+import os
+from utils import OceanDataset, regrid_xy, train_one_epoch, eval_epoch
+os.environ["HDF5_USE_FILE_LOCKING"] = "FALSE"
+
 import torch
 import torch.nn as nn
-import torch.fft
-from torch.utils.data import Dataset, DataLoader
-import matplotlib.pyplot as plt
+from torch.utils.data import DataLoader, Dataset
 import numpy as np
-import os
-from neuralop.models import FNO
-from neuralop.utils import count_model_params
-from neuralop.training import AdamW
-from neuralop import LpLoss, H1Loss
-import sys
-from functools import wraps
 import xarray as xr
-
-from neuralop import Trainer
-# Each sample shape: [channels, lat, lon]
-# Channels:
-# 0: SSH
-# 1: U velocity
-# 2: V velocity
-# 3: Wind U
-# 4: Wind V
-# 5: Sea level pressure
-# 6: Bathymetry (static)
-
-# Input shape:  [batch, 7, lat, lon]
-# Output shape: [batch, 3, lat, lon]  (SSH, U, V at t+1)
-
-# Using CPU
-device = "cpu"
-#Loading the dataset
-# Create a data processor for the Nordic sea dataset
-from data_processing import OceanDataset
-
-
 from scipy.interpolate import griddata
 
-# Load variables from your NetCDF files
-ssh = xr.open_mfdataset("data/*ssh.nc", combine="by_coords", chunks={"time_counter": 10})["ssh"].rename("ssh")
-u = xr.open_mfdataset("data/*ubar.nc", combine="by_coords", chunks={"time_counter": 10})["ubar"].rename("u")
-v = xr.open_mfdataset("data/*vbar.nc", combine="by_coords", chunks={"time_counter": 10})["vbar"].rename("v")
-forcing = xr.open_mfdataset("data/forcing/*.nc", combine="by_coords", chunks={"time": 10})
-bath = xr.open_dataset("data/nordic_seas_domain_cfg.nc")
+from neuralop.models import FNO
+from neuralop.training import AdamW
+from neuralop import LpLoss
 
-# Regrid forcing from regular lat/lon to the NEMO nav_lat/nav_lon grid.
+# -------------------------
+# 0. Device
+# -------------------------
+device = "cuda" if torch.cuda.is_available() else "cpu"
+print("Using device:", device)
+
+# -------------------------
+# 1. Load data
+# -------------------------
+ssh = xr.open_mfdataset(
+    "data/*ssh.nc",
+    combine="by_coords",
+    chunks={"time_counter": 10},
+    engine="netcdf4",
+    lock=False
+)["ssh"].rename("ssh")
+
+u = xr.open_mfdataset(
+    "data/*ubar.nc",
+    combine="by_coords",
+    chunks={"time_counter": 10},
+    engine="netcdf4",
+    lock=False
+)["ubar"].rename("u")
+
+v = xr.open_mfdataset(
+    "data/*vbar.nc",
+    combine="by_coords",
+    chunks={"time_counter": 10},
+    engine="netcdf4",
+    lock=False
+)["vbar"].rename("v")
+
+forcing = xr.open_mfdataset(
+    "data/forcing/*.nc",
+    combine="by_coords",
+    chunks={"time_counter": 10},
+    engine="netcdf4",
+    lock=False
+)
+
+bath = xr.open_dataset(
+    "data/nordic_seas_domain_cfg.nc",
+    engine="netcdf4",
+    lock=False
+)
+
+# Regrid forcing to NEMO grid
 forcing = forcing.interp(time=ssh["time_counter"], method="nearest")
 forcing = forcing.rename({"time": "time_counter"})
 
@@ -69,212 +85,87 @@ nemo_lon = ssh["nav_lon"].values
 target_points = np.column_stack((nemo_lat.ravel(), nemo_lon.ravel()))
 
 
-def regrid_xy(da: xr.DataArray) -> xr.DataArray:
-    values = da.values
-    result = np.empty((values.shape[0],) + nemo_lat.shape, dtype=np.float32)
-    for t in range(values.shape[0]):
-        linear = griddata(
-            source_points,
-            values[t].ravel(),
-            target_points,
-            method="linear",
-            fill_value=np.nan,
-        )
-        if np.isnan(linear).any():
-            nearest = griddata(
-                source_points,
-                values[t].ravel(),
-                target_points,
-                method="nearest",
-            )
-            linear[np.isnan(linear)] = nearest[np.isnan(linear)]
-        result[t] = linear.reshape(nemo_lat.shape)
-    return xr.DataArray(
-        result,
-        coords={"time_counter": ssh["time_counter"], "y": ssh["y"], "x": ssh["x"]},
-        dims=("time_counter", "y", "x"),
-    )
 
 wind_u = regrid_xy(forcing["u10"]).rename("wind_u")
 wind_v = regrid_xy(forcing["v10"]).rename("wind_v")
-slp = regrid_xy(forcing["msl"]).rename("slp")
+slp    = regrid_xy(forcing["msl"]).rename("slp")
 
 ssh, u, v, wind_u, wind_v, slp = xr.align(
     ssh, u, v, wind_u, wind_v, slp,
     join="inner"
 )
 
-# Split by time
-train = xr.merge([ssh, u, v, wind_u, wind_v, slp]).sel(time_counter=slice('1980', '2010'))
-val = xr.merge([ssh, u, v, wind_u, wind_v, slp]).sel(time_counter=slice('2011', '2018'))
-test = xr.merge([ssh, u, v, wind_u, wind_v, slp]).sel(time_counter=slice('2019', '2024'))
+# -------------------------
+# 2. Train/val/test split
+# -------------------------
+train = xr.merge([ssh, u, v, wind_u, wind_v, slp]).sel(time_counter=slice("1980", "2010"))
+val   = xr.merge([ssh, u, v, wind_u, wind_v, slp]).sel(time_counter=slice("2011", "2018"))
+test  = xr.merge([ssh, u, v, wind_u, wind_v, slp]).sel(time_counter=slice("2019", "2024"))
 
-# Create datasets
-train_dataset = OceanDataset(
-    ssh=train['ssh'],
-    u=train['u'],
-    v=train['v'],
-    wind_u=train['wind_u'],
-    wind_v=train['wind_v'],
-    slp=train['slp'],
-    bathymetry=bath['bathy_metry']
-)
+bathymetry = bath["bathy_metry"]  # [y, x]
 
-val_dataset = OceanDataset(
-    ssh=val['ssh'],
-    u=val['u'],
-    v=val['v'],
-    wind_u=val['wind_u'],
-    wind_v=val['wind_v'],
-    slp=val['slp'],
-    bathymetry=bath['bathy_metry']
-)
+# -------------------------
+# 3. Dataset with shared normalization
+# -------------------------
+# Compute normalization from train only
+train_ssh = torch.from_numpy(train["ssh"].values).float()
+train_u   = torch.from_numpy(train["u"].values).float()
+train_v   = torch.from_numpy(train["v"].values).float()
+train_wu  = torch.from_numpy(train["wind_u"].values).float()
+train_wv  = torch.from_numpy(train["wind_v"].values).float()
+train_slp = torch.from_numpy(train["slp"].values).float()
 
-test_dataset = OceanDataset(
-    ssh=test['ssh'],
-    u=test['u'],
-    v=test['v'],
-    wind_u=test['wind_u'],
-    wind_v=test['wind_v'],
-    slp=test['slp'],
-    bathymetry=bath['bathy_metry']
-)
-# For each timestep t:
-# input_t = torch.stack([
-#     ssh[t], u[t], v[t],        # current state
-#     wind_u[t], wind_v[t],      # forcings
-#     slp[t],                     # forcing
-#     bathymetry                  # static
-# ], dim=0)
+train_stack = torch.stack(
+    [train_ssh, train_u, train_v, train_wu, train_wv, train_slp],
+    dim=1
+)  # [T, 6, H, W]
 
-# target_t = torch.stack([
-#     ssh[t+1], u[t+1], v[t+1]  # next state to predict
-# ], dim=0)
+mean = train_stack.mean(dim=(0, 2, 3), keepdim=True)  # [1, 6, 1, 1]
+std  = train_stack.std(dim=(0, 2, 3), keepdim=True) + 1e-6
 
-train_loader = DataLoader(
-    train_dataset,
-    batch_size=8,        # Adjust based on GPU memory
-    shuffle=True,        # Shuffle training data
-    num_workers=4,       # Parallel data loading
-    pin_memory=True      # Faster GPU transfer
-)
+train_dataset = OceanDataset(train, bathymetry, mean=mean, std=std)
+val_dataset   = OceanDataset(val,   bathymetry, mean=mean, std=std)
+test_dataset  = OceanDataset(test,  bathymetry, mean=mean, std=std)
 
-val_loader = DataLoader(
-    val_dataset,
-    batch_size=8,
-    shuffle=False,       # Don't shuffle validation
-    num_workers=4,
-    pin_memory=True
-)
+train_loader = DataLoader(train_dataset, batch_size=4, shuffle=True, num_workers=4)
+val_loader   = DataLoader(val_dataset,   batch_size=4, shuffle=False, num_workers=4)
+test_loader  = DataLoader(test_dataset,  batch_size=4, shuffle=False, num_workers=4)
 
-test_loader = DataLoader(
-    test_dataset,
-    batch_size=8,
-    shuffle=False,
-    num_workers=4,
-    pin_memory=True
-)
+# Quick sanity check
+x_batch, y_batch = next(iter(train_loader))
+print("Input batch:", x_batch.shape)   # [B, 7, H, W]
+print("Target batch:", y_batch.shape)  # [B, 3, H, W]
 
+# -------------------------
+# 4. FNO model
+# -------------------------
+# Choose n_modes smaller than H/2, W/2
+H, W = x_batch.shape[-2], x_batch.shape[-1]
+n_modes = (min(16, H // 2), min(16, W // 2))
 
-# Check a single batch
-input_batch, target_batch = next(iter(train_loader))
-print(f"Input shape:  {input_batch.shape}")   # [8, 7, lat, lon]
-print(f"Target shape: {target_batch.shape}")  # [8, 3, lat, lon]
-# normalise everything
+model = FNO(
+    n_modes=n_modes,
+    in_channels=7,
+    out_channels=3,
+    hidden_channels=64,
+    n_layers=4,
+    padding=8,          # important for non-periodic domain
+).to(device)
 
-# 6 hourly data
+optimizer = AdamW(model.parameters(), lr=1e-3)
+loss_fn = LpLoss(d=2, p=2)  # L2 loss over spatial domain
 
-#train test split
+# -------------------------
+# 5. Training loop
+# -------------------------
+n_epochs = 20
+for epoch in range(1, n_epochs + 1):
+    train_loss = train_one_epoch(model, train_loader, optimizer, loss_fn, device)
+    val_loss   = eval_epoch(model, val_loader, loss_fn, device)
+    print(f"Epoch {epoch:03d} | train loss: {train_loss:.4e} | val loss: {val_loss:.4e}")
 
-# Dataloader creation
-
-# Model creation
-# Create FNO model with specified parameters
-"""model = FNO(
-    n_modes=(16, 16),           # Fourier modes for each dimension
-    in_channels=1,              # Input channels
-    out_channels=1,             # Output channels
-    hidden_channels=32,         # Hidden layer width
-    projection_channel_ratio=2  # Channel expansion ratio
-)
-model = model.to(device)
-
-print(f"Model parameters: {count_model_params(model)}")
-
-# Setup optimizer and loss function
-optimizer = AdamW(model.parameters(), lr=8e-3, weight_decay=1e-4)
-l2loss = LpLoss(d=2, p=2)
-h1loss = H1Loss(d=2)
-
-# Training step - works exactly as before
-for batch_idx, (input_data, target_data) in enumerate(train_loader):
-    # Move data to device
-    input_data = input_data.to(device)    # Shape: (batch, channels, height, width)
-    target_data = target_data.to(device)  # Shape: (batch, channels, height, width)
-
-    # Forward pass - activations automatically offloaded to CPU
-    output = model(input_data)
-
-    # Compute loss
-    loss = l2loss(output, target_data)
-
-    # Backward pass - gradients computed with CPU-stored activations
-    optimizer.zero_grad()
-    loss.backward()
-    optimizer.step()
-
-
-
-# Count and display the number of parameters
-n_params = count_model_params(operator)
-print(f"\nOur model has {n_params} parameters.")
-sys.stdout.flush()
-
-
-optimizer = AdamW(operator.parameters(), lr=1e-2, weight_decay=1e-4)
-scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=30)
-
-
-
-l2loss = LpLoss(d=2, p=2)  # L2 loss for function values
-h1loss = H1Loss(d=2)  # H1 loss includes gradient information
-
-train_loss = h1loss
-eval_losses = {"h1": h1loss, "l2": l2loss}
-
-#Training the model
-#Display training configuration
-print("\n### MODEL ###\n", operator)
-print("\n### OPTIMIZER ###\n", optimizer)
-print("\n### SCHEDULER ###\n", scheduler)
-print("\n### LOSSES ###")
-print(f"\n * Train: {train_loss}")
-print(f"\n * Test: {eval_losses}")
-sys.stdout.flush()
-
-
-trainer = Trainer(
-    model=operator,
-    n_epochs=15,
-    device=device,
-    data_processor=data_processor,
-    wandb_log=False,  # Disable Weights & Biases logging for this tutorial
-    eval_interval=5,  # Evaluate every 5 epochs
-    use_distributed=False,  # Single GPU/CPU training
-    verbose=True,  # Print training progress
-)
-
-# Train the model on our Nordic sea dataset. The trainer will:
-# 1. Run the forward pass through the FNO
-# 2. Compute the H1 loss
-# 3. Backpropagate and update weights
-# 4. Evaluate on test data every 3 epochs
-trainer.train(
-    train_loader=train_loader,
-    test_loaders=test_loaders,
-    optimizer=optimizer,
-    scheduler=scheduler,
-    regularizer=False,
-    training_loss=train_loss,
-    eval_losses=eval_losses,
-)"""
+# -------------------------
+# 6. Simple test evaluation
+# -------------------------
+test_loss = eval_epoch(model, test_loader, loss_fn, device)
+print("Test loss:", test_loss)
