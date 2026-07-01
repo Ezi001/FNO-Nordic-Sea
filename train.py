@@ -10,7 +10,7 @@ Training a FNO on the North sea data
 """
 #Import dependencies
 import os
-from utils import OceanDataset, regrid_xy, train_one_epoch, eval_epoch
+from utils.utils import OceanDataset, regrid_xy, train_one_epoch, eval_epoch
 os.environ["HDF5_USE_FILE_LOCKING"] = "FALSE"
 
 import torch

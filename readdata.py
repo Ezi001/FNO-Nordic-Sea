@@ -1,4 +1,4 @@
-# File for visualising data sets.
+# File for visualising data sets
 
 import xarray as xr
 import matplotlib.pyplot as plt
