@@ -27,11 +27,17 @@ print(data_vbar)
 u10 = data['u10']  # Replace 'ssh' with your variable name
 #print(u10.values)  # Get the numpy array
 
-for i in range(0, 190):
-    data_vbar["vbar"].isel(time_counter=i).plot()
-    plt.show()
 
-data_vbar["vbar"].isel(time_counter=8700).plot()
+img = data_vbar["vbar"].isel(time_counter=0).plot(vmin=-0.6, vmax=0.6)
+cbar = img.colorbar
+cbar.set_label("meridional current")
+plt.title("ocean current in meridional direction at time 0")
+plt.show()
+
+img = data_vbar["vbar"].isel(time_counter=8700).plot()
+cbar = img.colorbar
+cbar.set_label("meridional current")
+plt.title("ocean current in meridional direction at time ")
 plt.show()
 
 print(data.lat.shape, data.lon.shape)

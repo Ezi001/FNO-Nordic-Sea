@@ -1,9 +1,12 @@
 import torch
 from torch.utils.data import Dataset
+import xarray as xr
+from scipy.interpolate import griddata
+import numpy as np
 
 class OceanDataset(Dataset):
     def __init__(self, ssh, u, v, wind_u, wind_v, slp, bathymetry,
-                 mean=None, std=None):
+                 horizon=1, mean=None, std=None):
         # ssh, u, v, wind_u, wind_v, slp: xarray DataArray [time, y, x]
         # bathymetry: xarray DataArray [y, x]
 
@@ -24,22 +27,25 @@ class OceanDataset(Dataset):
 
         self.fields = data                      # [T, 6, H, W]
         self.bathy = bathy_t.unsqueeze(0)       # [1, H, W]
-        self.n_samples = self.fields.shape[0] - 1
+        self.horizon = horizon
+        self.n_samples = self.fields.shape[0] - horizon
 
     def __len__(self):
         return self.n_samples
 
     def __getitem__(self, idx):
         x_t = self.fields[idx]          # [6, H, W]
-        x_tp1 = self.fields[idx + 1]    # [6, H, W]
+
+        # Sequence of forcing from t..t+horizon-1
+        forcing_seq = self.fields[idx: idx + self.horizon, 3:6]  # [horizon, 3, H, W]
+
+        # Target: SSH, U, V at t+1..t+horizon
+        target_seq = self.fields[idx + 1: idx + 1 + self.horizon, 0:3]  # [horizon, 3, H, W]
 
         # Input: 6 dynamic + 1 static bathy
         input_t = torch.cat([x_t, self.bathy], dim=0)  # [7, H, W]
 
-        # Target: SSH, U, V at t+1 → channels 0,1,2
-        target_t = x_tp1[0:3, ...]      # [3, H, W]
-
-        return input_t, target_t
+        return input_t, forcing_seq, target_seq
 
 
 

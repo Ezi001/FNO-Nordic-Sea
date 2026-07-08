@@ -15,10 +15,10 @@ os.environ["HDF5_USE_FILE_LOCKING"] = "FALSE"
 
 import torch
 import torch.nn as nn
-from torch.utils.data import DataLoader, Dataset
+from torch.utils.data import DataLoader
 import numpy as np
 import xarray as xr
-from scipy.interpolate import griddata
+
 
 from neuralop.models import FNO
 from neuralop.training import AdamW
@@ -39,7 +39,7 @@ ssh = xr.open_mfdataset(
     chunks={"time_counter": 10},
     engine="netcdf4",
     lock=False
-)["ssh"].rename("ssh")
+)["ssh"]
 
 u = xr.open_mfdataset(
     "data/*ubar.nc",
@@ -58,7 +58,7 @@ v = xr.open_mfdataset(
 )["vbar"].rename("v")
 
 forcing = xr.open_mfdataset(
-    "data/forcing/*.nc",
+    "data/fno_ERA5forcing_y1980m01.nc",
     combine="by_coords",
     chunks={"time_counter": 10},
     engine="netcdf4",
@@ -73,7 +73,8 @@ bath = xr.open_dataset(
 
 # Regrid forcing to NEMO grid
 forcing = forcing.interp(time=ssh["time_counter"], method="nearest")
-forcing = forcing.rename({"time": "time_counter"})
+if "time" in forcing.coords and "time_counter" in forcing.coords:
+    forcing = forcing.drop_vars("time")
 
 src_lon = forcing["lon"].values
 src_lat = forcing["lat"].values
