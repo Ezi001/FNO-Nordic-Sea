@@ -1,6 +1,6 @@
 """
 Name: Esther Zijerveld
-Training a FNO on the North sea data
+Training a FNO on the North sea data for my Master's Thesis
 
 1. loading and preprocessing the data
 2. creating FNO model architecture
