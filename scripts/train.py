@@ -10,7 +10,8 @@ Training a FNO on the North sea data for my Master's Thesis
 """
 #Import dependencies
 import os
-from utils.utils import OceanDataset, regrid_xy, train_one_epoch, eval_epoch
+from utils.utils import regrid_xy
+from utils.DataLoader import NordicSeaCurrentDataset
 os.environ["HDF5_USE_FILE_LOCKING"] = "FALSE"
 
 import torch
@@ -99,43 +100,85 @@ ssh, u, v, wind_u, wind_v, slp = xr.align(
 # -------------------------
 # 2. Train/val/test split
 # -------------------------
-train = xr.merge([ssh, u, v, wind_u, wind_v, slp]).sel(time_counter=slice("1980", "2010"))
-val   = xr.merge([ssh, u, v, wind_u, wind_v, slp]).sel(time_counter=slice("2011", "2018"))
-test  = xr.merge([ssh, u, v, wind_u, wind_v, slp]).sel(time_counter=slice("2019", "2024"))
+bathymetry = bath["bathy_metry"].rename("bathymetry")
 
-bathymetry = bath["bathy_metry"]  # [y, x]
+train = xr.merge([ssh, u, v, wind_u, wind_v, slp, bathymetry]).sel(time_counter=slice("1980", "2010"))
+val   = xr.merge([ssh, u, v, wind_u, wind_v, slp, bathymetry]).sel(time_counter=slice("2011", "2018"))
+test  = xr.merge([ssh, u, v, wind_u, wind_v, slp, bathymetry]).sel(time_counter=slice("2019", "2024"))
 
 # -------------------------
 # 3. Dataset with shared normalization
 # -------------------------
-# Compute normalization from train only
-train_ssh = torch.from_numpy(train["ssh"].values).float()
-train_u   = torch.from_numpy(train["u"].values).float()
-train_v   = torch.from_numpy(train["v"].values).float()
-train_wu  = torch.from_numpy(train["wind_u"].values).float()
-train_wv  = torch.from_numpy(train["wind_v"].values).float()
-train_slp = torch.from_numpy(train["slp"].values).float()
+input_vars = ("ssh", "u", "v", "wind_u", "wind_v", "slp")
 
-train_stack = torch.stack(
-    [train_ssh, train_u, train_v, train_wu, train_wv, train_slp],
-    dim=1
-)  # [T, 6, H, W]
+mean = np.array([train[var].mean().item() for var in input_vars], dtype=np.float32)
+std  = np.array([train[var].std().item() for var in input_vars], dtype=np.float32)
+std = np.where(std < 1e-6, 1.0, std).astype(np.float32)
 
-mean = train_stack.mean(dim=(0, 2, 3), keepdim=True)  # [1, 6, 1, 1]
-std  = train_stack.std(dim=(0, 2, 3), keepdim=True) + 1e-6
+train_dataset = NordicSeaCurrentDataset(
+    train,
+    input_vars=input_vars,
+    target_vars=("ssh", "u", "v"),
+    bathymetry_var="bathymetry",
+    horizon=1,
+    temporal_window=4,
+    return_temporal=True,
+    mean=mean,
+    std=std,
+)
+val_dataset = NordicSeaCurrentDataset(
+    val,
+    input_vars=input_vars,
+    target_vars=("ssh", "u", "v"),
+    bathymetry_var="bathymetry",
+    horizon=1,
+    temporal_window=4,
+    return_temporal=True,
+    mean=mean,
+    std=std,
+)
+test_dataset = NordicSeaCurrentDataset(
+    test,
+    input_vars=input_vars,
+    target_vars=("ssh", "u", "v"),
+    bathymetry_var="bathymetry",
+    horizon=1,
+    temporal_window=4,
+    return_temporal=True,
+    mean=mean,
+    std=std,
+)
 
-train_dataset = OceanDataset(train, bathymetry, mean=mean, std=std)
-val_dataset   = OceanDataset(val,   bathymetry, mean=mean, std=std)
-test_dataset  = OceanDataset(test,  bathymetry, mean=mean, std=std)
-
-train_loader = DataLoader(train_dataset, batch_size=4, shuffle=True, num_workers=4)
-val_loader   = DataLoader(val_dataset,   batch_size=4, shuffle=False, num_workers=4)
-test_loader  = DataLoader(test_dataset,  batch_size=4, shuffle=False, num_workers=4)
+train_loader = DataLoader(train_dataset, batch_size=4, shuffle=True, num_workers=0)
+val_loader   = DataLoader(val_dataset,   batch_size=4, shuffle=False, num_workers=0)
+test_loader  = DataLoader(test_dataset,  batch_size=4, shuffle=False, num_workers=0)
 
 # Quick sanity check
 x_batch, y_batch = next(iter(train_loader))
-print("Input batch:", x_batch.shape)   # [B, 7, H, W]
+print("Input batch:", x_batch.shape)   # [B, 7, T, H, W]
 print("Target batch:", y_batch.shape)  # [B, 3, H, W]
+
+
+class FNOtDWrapper(nn.Module):
+    def __init__(self, in_channels, out_channels=3, hidden_channels=64, n_layers=4, n_modes=(16, 16), padding=8):
+        super().__init__()
+        self.spatial_model = FNO(
+            n_modes=n_modes,
+            in_channels=in_channels,
+            out_channels=out_channels,
+            hidden_channels=hidden_channels,
+            n_layers=n_layers,
+            padding=padding,
+        )
+
+    def forward(self, x):
+        # x: [B, C, T, H, W]
+        b, c, t, h, w = x.shape
+        x_flat = x.permute(0, 2, 1, 3, 4).reshape(b * t, c, h, w)
+        out_flat = self.spatial_model(x_flat)
+        out = out_flat.reshape(b, t, out_flat.shape[1], h, w)
+        return out[:, -1]
+
 
 # -------------------------
 # 4. FNO model
@@ -144,17 +187,50 @@ print("Target batch:", y_batch.shape)  # [B, 3, H, W]
 H, W = x_batch.shape[-2], x_batch.shape[-1]
 n_modes = (min(16, H // 2), min(16, W // 2))
 
-model = FNO(
-    n_modes=n_modes,
-    in_channels=7,
+model = FNOtDWrapper(
+    in_channels=len(input_vars) + 1,
     out_channels=3,
     hidden_channels=64,
     n_layers=4,
-    padding=8,          # important for non-periodic domain
+    n_modes=n_modes,
+    padding=8,
 ).to(device)
 
 optimizer = AdamW(model.parameters(), lr=1e-3)
 loss_fn = LpLoss(d=2, p=2)  # L2 loss over spatial domain
+
+
+def train_one_epoch(model, loader, optimizer, loss_fn, device):
+    model.train()
+    total_loss = 0.0
+    n_samples = 0
+    for x, y in loader:
+        x = x.to(device)
+        y = y.to(device)
+        optimizer.zero_grad()
+        pred = model(x)
+        loss = loss_fn(pred, y)
+        loss.backward()
+        optimizer.step()
+        total_loss += loss.item() * x.size(0)
+        n_samples += x.size(0)
+    return total_loss / n_samples
+
+
+@torch.no_grad()
+def eval_epoch(model, loader, loss_fn, device):
+    model.eval()
+    total_loss = 0.0
+    n_samples = 0
+    for x, y in loader:
+        x = x.to(device)
+        y = y.to(device)
+        pred = model(x)
+        loss = loss_fn(pred, y)
+        total_loss += loss.item() * x.size(0)
+        n_samples += x.size(0)
+    return total_loss / n_samples
+
 
 # -------------------------
 # 5. Training loop
