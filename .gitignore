@@ -1,1 +1,4 @@
 /data/
+fno_nordic/
+__pycache__/
+.ipynb_checkpoints/

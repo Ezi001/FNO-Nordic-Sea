@@ -1,7 +1,9 @@
 """
-Name: Esther Zijerveld
-Training a FNO on the North sea data for my Master's Thesis
+Name: Esther Maud Zijerveld
+Date: 14.07.2026
+Training a FNO on the North sea data for my Master's Thesis to be completed in 2027.
 
+This training pipeline includes:
 1. loading and preprocessing the data
 2. creating FNO model architecture
 3. Setting up training components (optimizer, scheduler, losses)
@@ -10,15 +12,18 @@ Training a FNO on the North sea data for my Master's Thesis
 """
 #Import dependencies
 import os
+
 from utils.utils import regrid_xy
-from utils.DataLoader import NordicSeaCurrentDataset
+from utils.DataLoader import NordicSeaDataset
 os.environ["HDF5_USE_FILE_LOCKING"] = "FALSE"
 
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
+from torchvision import transforms
 import numpy as np
 import xarray as xr
+import sklearn
 
 
 from neuralop.models import FNO
@@ -30,6 +35,65 @@ from neuralop import LpLoss
 # -------------------------
 device = "cuda" if torch.cuda.is_available() else "cpu"
 print("Using device:", device)
+#kwargs = {'num_workers': os.cpu_count() if device == "cpu" else 4, 'pin_memory': True}
+
+
+# Transforms
+transform = transforms.Compose([
+    transforms.ToTensor(),
+    transforms.Normalize((0.1307,), (0.3081,))
+])
+
+
+# Hyperparameters
+
+
+#Load data
+dataset = NordicSeaDataset(ds =None, root_dir="../data",transform= transform)
+
+n = 128480
+train_size = 87600
+val_size = 29200
+test_size = 128480 - train_size - val_size
+
+generator = torch.Generator().manual_seed(42)
+
+# train_set, val_set, test_set = torch.utils.data.random_split(dataset, 
+#                                                     [train_size, val_size, test_size],
+#                                                     generator=generator
+# )
+
+
+
+# train_loader = DataLoader(train_set, batch_size=32, shuffle=True)
+# val_loader = DataLoader(val_set, batch_size=32, shuffle=False)
+# val_loader = DataLoader(test_set, batch_size=32, shuffle=False)
+
+
+train_dataset = NordicSeaDataset(
+    root_dir="../data",
+    start_time="1980-01-01",
+    end_time="2009-12-31 23:00",
+    input_lag=4,
+    stats=train_stats
+)
+
+val_dataset = NordicSeaDataset(
+    root_dir="../data",
+    start_time="2010-01-01",
+    end_time="2019-12-31 23:00",
+    input_lag=4,
+    stats=train_stats
+)
+
+test_dataset = NordicSeaDataset(
+    ssh_path="../data",
+    start_time="2020-01-01",
+    end_time="2024-12-31 23:00",
+    input_lag=4,
+    stats=train_stats
+)
+
 
 # -------------------------
 # 1. Load data
@@ -115,6 +179,7 @@ mean = np.array([train[var].mean().item() for var in input_vars], dtype=np.float
 std  = np.array([train[var].std().item() for var in input_vars], dtype=np.float32)
 std = np.where(std < 1e-6, 1.0, std).astype(np.float32)
 
+# Create instances of datset with prepared data
 train_dataset = NordicSeaCurrentDataset(
     train,
     input_vars=input_vars,
@@ -149,9 +214,10 @@ test_dataset = NordicSeaCurrentDataset(
     std=std,
 )
 
-train_loader = DataLoader(train_dataset, batch_size=4, shuffle=True, num_workers=0)
-val_loader   = DataLoader(val_dataset,   batch_size=4, shuffle=False, num_workers=0)
-test_loader  = DataLoader(test_dataset,  batch_size=4, shuffle=False, num_workers=0)
+# Creating dataloader for train, validation and test.
+train_loader = DataLoader(train_dataset, batch_size=32, shuffle=True, kwargs=kwargs)
+val_loader   = DataLoader(val_dataset,   batch_size=32, shuffle=False, **kwargs)
+test_loader  = DataLoader(test_dataset,  batch_size=32, shuffle=False, **kwargs)
 
 # Quick sanity check
 x_batch, y_batch = next(iter(train_loader))
@@ -196,6 +262,7 @@ model = FNOtDWrapper(
     padding=8,
 ).to(device)
 
+# defining optimiser and loss function.
 optimizer = AdamW(model.parameters(), lr=1e-3)
 loss_fn = LpLoss(d=2, p=2)  # L2 loss over spatial domain
 

@@ -103,6 +103,8 @@ def open_ocean_dataset(
 class OceanDataset(Dataset):
     """
     Dataset for loading ocean state, forcing variables and a static bathymetry field.
+    Inputs: ssh, u, v, wind_u, wind_v, slp at time t and bathymetry.
+    Targets: ssh, u, v at time t + horizon.
     """
     def __init__(self, ssh, u=None, v=None, wind_u=None, wind_v=None, slp=None,
                  bathymetry=None, horizon=1, mean=None, std=None):
