@@ -12,7 +12,7 @@ from torch.utils.data import Dataset
 
 
 class NordicSeaDataset(Dataset):
-    """Simple PyTorch dataset for Nordic Sea fields stored in xarray datasets (NetCDF (*.nc)).
+    """Simple PyTorch dataset for Nordic Sea fields stored in xarray datasets (NetCDF (*.nc) files).
     Dataset provides an interface for accessing data.
     Inputs: Ocean variables: u,v,ssh. Forcing: u, v, slp. Static: bathymetry.
     This version can return either:
@@ -36,7 +36,6 @@ class NordicSeaDataset(Dataset):
                  root_dir,
                  input_vars=("ssh", "u", "v", "wind_u", "wind_v", "slp"), 
                  target_vars=("ssh", "u", "v"), 
-                time_dim=None,
                 temporal_window=1,
                 return_temporal=False,
                 transform=None,
@@ -64,12 +63,11 @@ class NordicSeaDataset(Dataset):
             self.root = (Path.cwd() / self.root).resolve()
         if not self.root.exists():
             fallback_root = (Path.cwd() / "data").resolve()
-            self.root = fallback_root if fallback_root.exists() else self.root
+            self.root = fallback_root
 
         self.transform = transform
         self.input_vars = list(input_vars)
         self.target_vars = list(target_vars)
-
         self.temporal_window = int(temporal_window)
         self.return_temporal = bool(return_temporal)
         self.start_time = start_time
@@ -86,6 +84,7 @@ class NordicSeaDataset(Dataset):
             engine="netcdf4",
             lock=False,
         )["ssh"].astype("float32")
+
         self.u_ds = xr.open_mfdataset(
             str(self.root / "*ubar.nc"),
             combine="by_coords",
@@ -93,6 +92,7 @@ class NordicSeaDataset(Dataset):
             engine="netcdf4",
             lock=False,
         )["ubar"].astype("float32")
+
         self.v_ds = xr.open_mfdataset(
             str(self.root / "*vbar.nc"),
             combine="by_coords",
@@ -100,6 +100,7 @@ class NordicSeaDataset(Dataset):
             engine="netcdf4",
             lock=False,
         )["vbar"].astype("float32")
+
         self.wind_u_ds = xr.open_mfdataset(
             str(self.root / "fno_ERA5forcing*.nc"),
             combine="by_coords",
@@ -107,6 +108,7 @@ class NordicSeaDataset(Dataset):
             engine="netcdf4",
             lock=False,
         )["u10"].astype("float32")
+
         self.wind_v_ds = xr.open_mfdataset(
             str(self.root / "fno_ERA5forcing*.nc"),
             combine="by_coords",
@@ -114,6 +116,7 @@ class NordicSeaDataset(Dataset):
             engine="netcdf4",
             lock=False,
         )["v10"].astype("float32")
+
         self.slp_ds = xr.open_mfdataset(
             str(self.root / "fno_ERA5forcing*.nc"),
             combine="by_coords",
@@ -126,9 +129,6 @@ class NordicSeaDataset(Dataset):
         self.u_ds = self.u_ds.rename({"time_counter": "time"})
         self.v_ds = self.v_ds.rename({"time_counter": "time"})
 
-        self.wind_u_ds = self.wind_u_ds.astype("float32")
-        self.wind_v_ds = self.wind_v_ds.astype("float32")
-        self.slp_ds = self.slp_ds.astype("float32")
 
         self.bathy_ds = xr.open_dataset(str(self.root / "nordic_seas_domain_cfg.nc"), engine="netcdf4")["bathy_metry"]
         self.bathy_array = np.asarray(self.bathy_ds.values, dtype=np.float32)
