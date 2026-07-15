@@ -1,3 +1,4 @@
+# Necessary imports
 import torch.nn as nn
 from neuralop.models import FNO
 
