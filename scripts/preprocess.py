@@ -1,5 +1,7 @@
+# Necessary imports
 import xarray as xr
 import os
+
 os.makedirs("processed", exist_ok=True)
 
 # Loading the data
@@ -182,11 +184,15 @@ state = state.assign_coords(
     channel=["ssh", "ubar", "vbar"]
 )
 
+print(state.dims)
+print(state.shape)
 
+print(forcing_tensor.dims)
+print(forcing_tensor.shape)
 
 # Save processed variables
 state.to_netcdf("processed/state.nc") # (time, y, x, 3)
-forcing_tensor.to_netcdf("processed/forcing.nc") # (time_y, x, 3)
+forcing_tensor.to_netcdf("processed/forcing.nc") # (time, y, x, 3)
 mask.to_netcdf("processed/ocean_mask.nc")
 normalization.to_netcdf(
     "processed/normalization_stats.nc"

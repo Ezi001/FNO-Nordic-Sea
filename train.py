@@ -1,178 +1,205 @@
-"""
-Name: Esther Maud Zijerveld
-Date: 14.07.2026
-Training a FNO on the North sea data for my Master's Thesis to be completed in 2027.
+"""Project-level train entry helpers."""
 
-This training pipeline includes:
-1. loading and preprocessing the data
-2. creating FNO model architecture
-3. Setting up training components (optimizer, scheduler, losses)
-4. Training the model
-5. Evaluating predictions
-"""
-#Import dependencies
-import os
+from __future__ import annotations
 
-from utils.DataLoader import NordicSeaDataset
-from models.fno import FNOtDWrapper
-os.environ["HDF5_USE_FILE_LOCKING"] = "FALSE"
+from dataclasses import dataclass
+from typing import Optional, Tuple
 
-import torch
-import torch.nn as nn
-from torch.utils.data import DataLoader
-from torchvision import transforms
+import jax
+import jax.numpy as jnp
 import numpy as np
-import xarray as xr
-import sklearn
+import optax
+from flax.training.train_state import TrainState
+from jax import value_and_grad
+from jax.tree_util import tree_leaves
+from tqdm.auto import trange
+
+from utils.data import prepare_tf_data, prefetch_to_device
+from utils.checkpoints import save_train_state
+from utils.logging import ExperimentLogger
+from utils.metrics import relative_L2_error, relative_frobenius_error, rmse
+
+@dataclass
+class CFOTrainArgs:
+    num_epochs: int = 1000
+    random_seed: int = 0
+    use_wandb: bool = False
+    log_mode: str = "auto"
+    train_log_interval: int = 1
+    console_logging: bool = True
+    learning_rate: float = 1e-3
+    beta1: float = 0.9
+    beta2: float = 0.999
+    do_eval: bool = False
+    eval_interval: int = 500
+    irregular_time: bool = False
+    running_ckpt_dir: str | None = None
+    running_ckpt_prefix: str = "running_"
+    running_ckpt_interval: int = 0
+    running_ckpt_max_to_keep: int = 3
+    best_ckpt_dir: str | None = None
+    best_ckpt_prefix: str = "best_"
+
+def train_cfo(method, spline_dataloader, args: CFOTrainArgs, eval_dataset: Optional[Tuple[np.ndarray, np.ndarray]] = None):
+    state = init_cfo_train_state(
+        method,
+        seed=args.random_seed,
+        learning_rate=args.learning_rate,
+        beta1=args.beta1,
+        beta2=args.beta2,
+    )
+    loss_fn = method.loss_fn
+
+    def cfo_train_step(state: TrainState, batch):
+        loss, grads = value_and_grad(loss_fn)(state.params, batch)
+        state = state.apply_gradients(grads=grads)
+        return loss, state
+
+    step_jit = jax.jit(cfo_train_step)
+
+    logger = ExperimentLogger.create(
+        use_wandb=args.use_wandb,
+        log_mode=args.log_mode,
+        train_log_interval=args.train_log_interval,
+        console=args.console_logging,
+    )
+    num_params = sum(x.size for x in tree_leaves(state.params))
+    logger.info(f"Model parameters: {int(num_params)}")
+
+    rng_key = jax.random.PRNGKey(args.random_seed)
+    pbar = trange(args.num_epochs, desc="Training")
+    data = map(prepare_tf_data, spline_dataloader)
+    data = prefetch_to_device(data, 2)
+
+    loss_log: list[float] = []
+    best_state = state
+    best_l2_error = float("inf")
+    best_epoch = -1
+
+    for epoch in pbar:
+        rng_key, time_key, noise_key = jax.random.split(rng_key, 3)
+        batch = _prepare_cfo_train_batch(method, next(data), time_key, noise_key)
+        loss, state = step_jit(state, batch)
+
+        should_save_running_interval = (
+            args.running_ckpt_dir is not None
+            and args.running_ckpt_interval > 0
+            and (epoch + 1) % args.running_ckpt_interval == 0
+        )
+
+        if args.do_eval and (epoch % args.eval_interval == 0) and epoch > 0 and eval_dataset is not None:
+            rel_l2_value, rmse_value, rel_fro_value = _run_cfo_eval(method, state, epoch, eval_dataset, logger)
+            should_save_running_interval = should_save_running_interval or (args.running_ckpt_dir is not None)
+            if rel_l2_value < best_l2_error:
+                best_l2_error = rel_l2_value
+                best_state = state
+                best_epoch = epoch
+                if args.best_ckpt_dir is not None:
+                    save_train_state(
+                        best_state,
+                        args.best_ckpt_dir,
+                        prefix=args.best_ckpt_prefix,
+                        step=epoch,
+                        max_to_keep=1,
+                    )
+                logger.info(
+                    f"[eval] epoch={epoch} rel_l2={rel_l2_value:.6f} rmse={rmse_value:.6f} rel_fro={rel_fro_value:.6f} [BEST]"
+                )
+            else:
+                logger.info(
+                    f"[eval] epoch={epoch} rel_l2={rel_l2_value:.6f} rmse={rmse_value:.6f} rel_fro={rel_fro_value:.6f}"
+                )
+
+        if should_save_running_interval:
+            save_train_state(
+                state,
+                args.running_ckpt_dir,
+                prefix=args.running_ckpt_prefix,
+                step=epoch,
+                max_to_keep=args.running_ckpt_max_to_keep,
+            )
+
+        loss_value = float(loss)
+        loss_log.append(loss_value)
+        pbar.set_postfix({"loss": loss_value})
+    print("Training complete.")
+
+    return {
+        "state": state,
+        "best_state": best_state,
+        "best_l2_error": best_l2_error,
+        "best_epoch": best_epoch,
+        "loss_log": loss_log,
+    }
+
+def init_cfo_train_state(
+    method,
+    *,
+    seed: int,
+    learning_rate: float = 1e-4,
+    beta1: float = 0.9,
+    beta2: float = 0.99,
+) -> TrainState:
+    rng_key = jax.random.PRNGKey(seed)
+    x = jnp.ones((1,) + tuple(method.input_shape), dtype=jnp.float32)
+    t = jnp.ones((1,), dtype=jnp.float32)
+    if method.use_condition:
+        c = jnp.ones((1,) + tuple(method.condition_shape), dtype=jnp.float32)
+        variables = method.model.init(rng_key, x, t, c)
+    else:
+        variables = method.model.init(rng_key, x, t)
+
+    tx = optax.adam(learning_rate=float(learning_rate), b1=float(beta1), b2=float(beta2))
+    return TrainState.create(apply_fn=method.model.apply, params=variables['params'], tx=tx)
+
+def _run_cfo_eval(method, state, epoch: int, eval_dataset, logger: ExperimentLogger):
+    if method.use_condition:
+        x0_eval, target_eval, condition_eval = eval_dataset
+    else:
+        x0_eval, target_eval = eval_dataset
+        condition_eval = None
+
+    pred_eval = method.uniform_inference(
+        state,
+        x0_eval,
+        trajectory_points_num=target_eval.shape[1],
+        steps_per_segment=2,
+        condition=condition_eval,
+        method="RK4",
+    )
+    rel_fro_value = relative_frobenius_error(target_eval, pred_eval)
+    rmse_value = rmse(target_eval, pred_eval)
+    rel_l2_value = relative_L2_error(target_eval, pred_eval)
+
+    logger.log(
+        {
+            "eval/epoch": epoch,
+            "eval/Relative_L2_Error": rel_l2_value,
+            "eval/RMSE": rmse_value,
+            "eval/Relative_Frobenius_Error": rel_fro_value,
+        },
+        commit=False,
+    )
+    return float(rel_l2_value), float(rmse_value), float(rel_fro_value)
 
 
-from neuralop.models import FNO
-from neuralop.training import AdamW
-from neuralop import LpLoss
+def _prepare_cfo_train_batch(method, raw_batch, time_key, noise_key):
+    if method.use_condition:
+        spline_coef, t_start, t_end, condition, *_ = raw_batch
+    else:
+        spline_coef, t_start, t_end, *_ = raw_batch
+        condition = None
 
-# -------------------------
-# 0. Device
-# -------------------------
-device = "cuda" if torch.cuda.is_available() else "cpu"
-print("Using device:", device)
+    spline_coef = spline_coef[0]
+    t_start = t_start[0]
+    t_end = t_end[0]
+    dt = t_end - t_start
+    delta_t = jax.random.uniform(time_key, shape=(len(dt),), minval=0.0, maxval=dt)
 
-kwargs = {'num_workers': 0, 'pin_memory': False if device=="cpu" else True}
-root_dir = "../data"
+    x0 = spline_coef[:, 0]
+    eps = jax.random.normal(noise_key, x0.shape)
 
-# -------------------------
-# Transforms
-# -------------------------
-transform = transforms.Compose([
-    transforms.ToTensor(),
-    transforms.Normalize((0.1307,), (0.3081,))
-])
-
-# -------------------------
-# Hyperparameters
-# -------------------------
-
-
-# Remove top-level dataset creation to avoid multiprocessing at import time.
-
-# -------------------------
-#Load data
-# -------------------------
-train_dataset = NordicSeaDataset(
-    root_dir=root_dir,
-    start_time="1980-01-01",
-    end_time="2009-12-31 23:00",
-    temporal_window=4,
-
-)
-
-val_dataset = NordicSeaDataset(
-    root_dir=root_dir,
-    start_time="2010-01-01",
-    end_time="2019-12-31 23:00",
-    temporal_window=4,
-
-)
-
-test_dataset = NordicSeaDataset(
-    root_dir=root_dir,
-    start_time="2020-01-01",
-    end_time="2024-12-31 23:00",
-    temporal_window=4,
-)
-
-
-
-# # Regrid forcing to NEMO grid
-# forcing = forcing.interp(time=ssh["time_counter"], method="nearest")
-# if "time" in forcing.coords and "time_counter" in forcing.coords:
-#     forcing = forcing.drop_vars("time")
-
-# src_lon = forcing["lon"].values
-# src_lat = forcing["lat"].values
-# src_lon2d, src_lat2d = np.meshgrid(src_lon, src_lat)
-# source_points = np.column_stack((src_lat2d.ravel(), src_lon2d.ravel()))
-
-# nemo_lat = ssh["nav_lat"].values
-# nemo_lon = ssh["nav_lon"].values
-# target_points = np.column_stack((nemo_lat.ravel(), nemo_lon.ravel()))
-
-
-
-# wind_u = regrid_xy(forcing["u10"]).rename("wind_u")
-# wind_v = regrid_xy(forcing["v10"]).rename("wind_v")
-# slp    = regrid_xy(forcing["msl"]).rename("slp")
-
-# ssh, u, v, wind_u, wind_v, slp = xr.align(
-#     ssh, u, v, wind_u, wind_v, slp,
-#     join="inner"
-# )
-
-
-
-# -------------------------
-# 3. Dataset with shared normalization
-# -------------------------
-input_vars = ("ssh", "u", "v", "wind_u", "wind_v", "slp")
-output_vars = ("ssh", "u", "v")
-
-# mean = np.array([train[var].mean().item() for var in input_vars], dtype=np.float32)
-# std  = np.array([train[var].std().item() for var in input_vars], dtype=np.float32)
-# std = np.where(std < 1e-6, 1.0, std).astype(np.float32)
-
-
-# -----------------------
-# Creating dataloader for train, validation and test.
-# -----------------------
-train_loader = DataLoader(train_dataset, batch_size=32, shuffle=True, num_workers=0)
-val_loader   = DataLoader(val_dataset,   batch_size=32, shuffle=False, num_workers=0)
-test_loader  = DataLoader(test_dataset,  batch_size=32, shuffle=False, num_workers=0)
-
-# Quick sanity check
-x_batch, y_batch = next(iter(train_loader))
-print("Input batch:", x_batch.shape)   # [B, 7, T, H, W]
-print("Target batch:", y_batch.shape)  # [B, 3, H, W]
-
-
-
-
-
-# -------------------------
-# 4. FNO model
-# -------------------------
-# Choose n_modes smaller than H/2, W/2
-H, W = x_batch.shape[-2], x_batch.shape[-1]
-n_modes = (min(16, H // 2), min(16, W // 2))
-
-model = FNOtDWrapper(
-    in_channels=len(input_vars) + 1,
-    out_channels=3,
-    hidden_channels=64,
-    n_layers=4,
-    n_modes=n_modes,
-    padding=8,
-).to(device)
-
-# defining optimiser and loss function.
-optimizer = AdamW(model.parameters(), lr=1e-3)
-loss_fn = LpLoss(d=2, p=2)  # L2 loss over spatial domain
-
-
-from utils.utils import train_one_epoch, eval_epoch
-
-
-
-if __name__ == '__main__':
-    # -------------------------
-    # 5. Training loop
-    # -------------------------
-    n_epochs = 20
-    for epoch in range(1, n_epochs + 1):
-        train_loss = train_one_epoch(model, train_loader, optimizer, loss_fn, device)
-        val_loss = eval_epoch(model, val_loader, loss_fn, device)
-        print(f"Epoch {epoch:03d} | train loss: {train_loss:.4e} | val loss: {val_loss:.4e}")
-
-    # -------------------------
-    # 6. Simple test evaluation
-    # -------------------------
-    test_loss = eval_epoch(model, test_loader, loss_fn, device)
-    print("Test loss:", test_loss)
+    if method.use_condition:
+        condition = condition[0]
+        return (spline_coef, condition, t_start, t_end, delta_t, eps)
+    return (spline_coef, t_start, t_end, delta_t, eps)

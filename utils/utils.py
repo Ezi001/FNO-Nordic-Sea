@@ -6,6 +6,13 @@ import xarray as xr
 from scipy.interpolate import griddata
 import numpy as np
 
+def create_windows(data, window):
+    samples = []
+
+    for i in range(len(data) - window):
+        samples.append(data[i:i+window])
+
+    return np.stack(samples)
 
 def _open_dataarray(path_or_paths, var_name, chunks=None, concat_dim='time', use_cftime=False):
     if isinstance(path_or_paths, (list, tuple)):
