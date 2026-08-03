@@ -7,6 +7,7 @@ import os
 from pathlib import Path
 import sys
 import numpy as np
+import torch
 
 os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "3")
 os.environ.setdefault("ABSL_MIN_LOG_LEVEL", "3")
@@ -15,11 +16,12 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-#from utils.readers import load_nordic_splits
-from cfo import ContinuousFlowOperator
+from utils.readers import load_nordic_sea_splits, load_nordic_sea
+from cfo_torch import ContinuousFlowOperator
 from models.factory import build_model
-from train_old import CFOTrainArgs, train_cfo
-from utils.data import build_dataloader, linear_spline, quintic_spline_batch, load_partial_data, build_trajectories, load_nordic_seas_data
+from train import CFOTrainArgs, train_cfo
+from utils.data_torch import build_dataloader, linear_spline, quintic_spline_batch, load_partial_data, build_trajectories, load_nordic_seas_data
+from utils.dataset_loaders import load_dataset_splits
 from utils.metrics import relative_L2_error, relative_frobenius_error, rmse
 from utils.seed import set_global_seed
 
@@ -42,7 +44,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--gamma", type=float, default=1e-5)
 
     # data / model
-    parser.add_argument("--dataset", type=str, default="nordic", choices=["nordic"])
+    parser.add_argument("--dataset", type=str, default="nordic sea", choices=["nordic sea"])
     parser.add_argument("--dataset-path", type=str, default=None)
     parser.add_argument("--model", type=str, default="FNO2d", choices=["FNO2d"])
     parser.add_argument("--spline-type", type=str, default="quintic", choices=["linear", "quintic"])
@@ -97,7 +99,20 @@ def main() -> None:
         print(args)
         return
 
-    state, forcing = load_nordic_seas_data(args.dataset_path)
+    """
+    Loading train/eval/test splits of nordic sea dataset
+    """
+    splits = load_dataset_splits("nordic",
+        processed_dir="processed",
+        trajectory_window=728,
+        stride=1,
+        normalize=True,
+    )
+
+    train_state, train_forcing = splits["train"]
+    eval_state, eval_forcing = splits["eval"]
+    test_state, test_forcing = splits["test"]
+    """state, forcing = load_nordic_seas_data(args.dataset_path)
 
     state_traj = build_trajectories(
             state,
@@ -123,7 +138,7 @@ def main() -> None:
 
     train_forcing = forcing_traj[:train_end]
     eval_forcing = forcing_traj[train_end:eval_end]
-    test_forcing = forcing_traj[eval_end:]
+    test_forcing = forcing_traj[eval_end:]"""
 
 
     train_time = None
@@ -204,11 +219,10 @@ def main() -> None:
 
     print("Running final test inference...")
     test_pred = method.uniform_inference(
-        state_for_test,
-        test_state[:, 0],
-        test_forcing,
+        x_0=torch.as_tensor(test_state[:, 0], dtype=torch.float32),
         trajectory_points_num=test_state.shape[1],
         steps_per_segment=2,
+        condition=torch.as_tensor(test_forcing, dtype=torch.float32),
         method="RK4",
     )
     test_rmse = rmse(test_state, test_pred)
