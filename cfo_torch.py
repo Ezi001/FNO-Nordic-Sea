@@ -196,12 +196,20 @@ class ContinuousFlowOperator:
             for idx in range(points_num - 1):
                 s = idx * segment_dt
                 t = (idx + 1) * segment_dt
+
+                if condition is None:
+                    condition_i = None
+                elif condition.ndim == 5:
+                    condition_i = condition[:, idx]
+                else:
+                    condition_i = condition
+
                 x = self.infer_at(
                     x,
                     s=s,
                     t=t,
                     steps=segment_steps + 1,
-                    condition=condition,
+                    condition=condition_i,
                     method=method,
                 )
                 preds.append(x.detach().cpu().numpy())

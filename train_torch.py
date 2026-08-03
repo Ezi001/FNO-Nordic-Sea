@@ -4,13 +4,14 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from typing import Optional, Tuple
+import copy
 
 import numpy as np
 import torch
 import torch.nn as nn
 from tqdm.auto import trange
 
-from utils.data import prepare_torch_data  # analogue of prepare_tf_data, no device-sharding needed
+from utils.data_torch import prepare_torch_data  # analogue of prepare_tf_data, no device-sharding needed
 from utils.checkpoints import save_train_state
 from utils.logging import ExperimentLogger
 from utils.metrics import relative_L2_error, relative_frobenius_error, rmse
@@ -38,27 +39,6 @@ class CFOTrainArgs:
     best_ckpt_prefix: str = "best_"
     device: str = "cuda" if torch.cuda.is_available() else "cpu"
 
-
-@dataclass
-class ARTrainArgs:
-    num_epochs: int = 1000
-    random_seed: int = 0
-    use_wandb: bool = False
-    log_mode: str = "auto"
-    train_log_interval: int = 1
-    console_logging: bool = True
-    learning_rate: float = 1e-3
-    beta1: float = 0.9
-    beta2: float = 0.999
-    do_eval: bool = False
-    eval_interval: int = 500
-    running_ckpt_dir: str | None = None
-    running_ckpt_prefix: str = "running_"
-    running_ckpt_interval: int = 0
-    running_ckpt_max_to_keep: int = 3
-    best_ckpt_dir: str | None = None
-    best_ckpt_prefix: str = "best_"
-    device: str = "cuda" if torch.cuda.is_available() else "cpu"
 
 
 @dataclass
@@ -121,7 +101,6 @@ def _run_cfo_eval(method, state: TrainState, epoch: int, eval_dataset, logger: E
     state.model.eval()
     with torch.no_grad():
         pred_eval = method.uniform_inference(
-            state.model,
             x0_eval,
             trajectory_points_num=target_eval.shape[1],
             steps_per_segment=2,
@@ -190,7 +169,7 @@ def train_cfo(method, spline_dataloader, args: CFOTrainArgs, eval_dataset: Optio
 
     def cfo_train_step(state: TrainState, batch):
         state.optimizer.zero_grad(set_to_none=True)
-        loss = loss_fn(state.model, batch)
+        loss = loss_fn(batch)
         loss.backward()
         state.apply_gradients()
         return loss.detach(), state
@@ -204,7 +183,7 @@ def train_cfo(method, spline_dataloader, args: CFOTrainArgs, eval_dataset: Optio
     num_params = sum(p.numel() for p in state.model.parameters())
     logger.info(f"Model parameters: {int(num_params)}")
 
-    generator = torch.Generator(device=device if device != "cuda" else "cpu")
+    generator = torch.Generator(device=device)
     generator.manual_seed(args.random_seed)
 
     pbar = trange(args.num_epochs, desc="Training")
@@ -212,7 +191,7 @@ def train_cfo(method, spline_dataloader, args: CFOTrainArgs, eval_dataset: Optio
     data_iter = iter(data)
 
     loss_log: list[float] = []
-    best_state = state
+    best_state = copy.deepcopy(state.model.state_dict())
     best_l2_error = float("inf")
     best_epoch = -1
 

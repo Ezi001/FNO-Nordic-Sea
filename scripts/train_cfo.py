@@ -16,11 +16,11 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from utils.readers import load_nordic_sea_splits, load_nordic_sea
+from utils.dataset_loaders import load_nordic_sea_splits, load_nordic_sea
 from cfo_torch import ContinuousFlowOperator
 from models.factory import build_model
-from train import CFOTrainArgs, train_cfo
-from utils.data_torch import build_dataloader, linear_spline, quintic_spline_batch, load_partial_data, build_trajectories, load_nordic_seas_data
+from train_torch import CFOTrainArgs, train_cfo
+from utils.data_torch import build_dataloader, linear_spline, quintic_spline_batch, load_partial_data
 from utils.dataset_loaders import load_dataset_splits
 from utils.metrics import relative_L2_error, relative_frobenius_error, rmse
 from utils.seed import set_global_seed
@@ -65,23 +65,44 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def _build_spline_dataset(train_data, spline_type: str, cond, batch_size: int, spline_batch_size: int, epochs: int, seed: int, time=None):
-    batch_n, traj_len = train_data.shape[:2] # B, T
-
+def _build_spline_dataset(train_data, spline_type, cond, batch_size, spline_batch_size, epochs, seed, time=None):
+    batch_n, traj_len = train_data.shape[:2]
 
     if time is None:
-        time = np.broadcast_to(np.linspace(0.0, 1.0, traj_len, dtype=train_data.dtype), (batch_n, traj_len))
+        time = np.broadcast_to(
+            np.linspace(0.0, 1.0, traj_len, dtype=train_data.dtype),
+            (batch_n, traj_len),
+        )
 
     if spline_type == "linear":
         spline_coef, start_time, end_time = linear_spline(train_data, time=time)
     else:
-        spline_coef, start_time, end_time = quintic_spline_batch(train_data, time=time, batch_size=spline_batch_size)
+        spline_coef, start_time, end_time = quintic_spline_batch(
+            train_data,
+            time=time,
+            batch_size=spline_batch_size,
+        )
+
+    # spline_coef: (B, T-1, 6, H, W, C)
+    # start_time:  (B, T-1)
+    # end_time:    (B, T-1)
+
+    B, S = spline_coef.shape[:2]  # S = T - 1
+
+    spline_coef = spline_coef.reshape(B * S, *spline_coef.shape[2:])
+    start_time = start_time.reshape(B * S)
+    end_time = end_time.reshape(B * S)
+
+    # simplest forcing choice: use forcing at segment start
+    # cond: (B, T, H, W, C_forcing)
+    cond = cond[:, :-1]
+    cond = cond.reshape(B * S, *cond.shape[2:])
 
     return build_dataloader(
         spline_coef,
         t1=start_time,
         t2=end_time,
-        c = cond,
+        c=cond,
         batch_size=batch_size,
         num_epochs=epochs,
         seed=seed,
@@ -143,8 +164,9 @@ def main() -> None:
 
     train_time = None
     if args.partial_train_ratio < 1.0:
-        train_state, train_time = load_partial_data(train_state, ratio=args.partial_train_ratio, seed=args.seed)
-        train_forcing, train_time = load_partial_data(train_forcing, ratio=args.partial_train_ratio, seed=args.seed)
+        print("disabled")
+        #train_state, train_time = load_partial_data(train_state, ratio=args.partial_train_ratio, seed=args.seed)
+        #train_forcing, train_time = load_partial_data(train_forcing, ratio=args.partial_train_ratio, seed=args.seed)
 
     input_shape = tuple(train_state.shape[2:]) # (H, W, 3)
     model = build_model(args.model, input_shape, use_condition=use_condition)
@@ -186,6 +208,7 @@ def main() -> None:
         gamma=float(args.gamma),
         spline_type=args.spline_type,
         use_condition=use_condition,
+        condition_shape=tuple(train_forcing.shape[2:])
     )
     train_args = CFOTrainArgs(
         num_epochs=args.epochs,
@@ -212,10 +235,6 @@ def main() -> None:
     )
     print("Starting training loop...")
     train_output = train_cfo(method, spline_loader, train_args, eval_dataset=eval_dataset)
-
-    state_for_test = train_output["state"]
-    if np.isfinite(train_output["best_l2_error"]):
-        state_for_test = train_output["best_state"]
 
     print("Running final test inference...")
     test_pred = method.uniform_inference(

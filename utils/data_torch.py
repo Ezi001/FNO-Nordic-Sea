@@ -10,7 +10,7 @@ import torch
 from numpy.lib.stride_tricks import sliding_window_view
 from torch.utils.data import DataLoader, TensorDataset
 
-from .splines import linear_spline, quintic_spline_batch
+from .splines_torch import linear_spline, quintic_spline_batch
 
 # NOTE: `linear_spline` / `quintic_spline_batch` are imported unchanged here.
 # If those are implemented in JAX (jnp), they'll need their own torch port —
