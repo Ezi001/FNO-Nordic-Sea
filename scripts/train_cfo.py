@@ -16,11 +16,10 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from utils.dataset_loaders import load_nordic_sea_splits, load_nordic_sea
 from cfo_torch import ContinuousFlowOperator
 from models.factory import build_model
 from train_torch import CFOTrainArgs, train_cfo
-from utils.data_torch import build_dataloader, linear_spline, quintic_spline_batch, load_partial_data
+from utils.data_torch import build_dataloader, linear_spline, quintic_spline_batch
 from utils.dataset_loaders import load_dataset_splits
 from utils.metrics import relative_L2_error, relative_frobenius_error, rmse
 from utils.seed import set_global_seed
@@ -87,16 +86,18 @@ def _build_spline_dataset(train_data, spline_type, cond, batch_size, spline_batc
     # start_time:  (B, T-1)
     # end_time:    (B, T-1)
 
-    B, S = spline_coef.shape[:2]  # S = T - 1
+    #B, S = spline_coef.shape[:2]  # S = T - 1
+    S = traj_len - 1
+    N = batch_n * S
 
-    spline_coef = spline_coef.reshape(B * S, *spline_coef.shape[2:])
-    start_time = start_time.reshape(B * S)
-    end_time = end_time.reshape(B * S)
+    spline_coef = spline_coef.reshape(N, *spline_coef.shape[2:])
+    start_time = start_time.reshape(N)
+    end_time = end_time.reshape(N)
 
     # simplest forcing choice: use forcing at segment start
     # cond: (B, T, H, W, C_forcing)
-    cond = cond[:, :-1]
-    cond = cond.reshape(B * S, *cond.shape[2:])
+    cond = cond[:, :-1].reshape(N, *cond.shape[2:])
+    #cond = cond
 
     return build_dataloader(
         spline_coef,
@@ -169,7 +170,11 @@ def main() -> None:
         #train_forcing, train_time = load_partial_data(train_forcing, ratio=args.partial_train_ratio, seed=args.seed)
 
     input_shape = tuple(train_state.shape[2:]) # (H, W, 3)
-    model = build_model(args.model, input_shape, use_condition=use_condition)
+    model = build_model(args.model, 
+                        input_shape, 
+                        use_condition=use_condition,
+                        condition_shape=tuple(train_forcing.shape[2:]),
+                        )
 
     task_desc = "partial snapshots" if args.partial_train_ratio < 1.0 else "full trajectories"
     print("=== TASK SUMMARY ===")

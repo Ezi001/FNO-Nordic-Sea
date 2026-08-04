@@ -1,33 +1,41 @@
 from __future__ import annotations
 
-"""Checkpoint save/load helpers built on Orbax CheckpointManager."""
-
 from pathlib import Path
 from typing import Any, Optional
 
-import orbax.checkpoint as ocp
+import torch
 
 
 def _manager_directory(ckpt_dir: str, prefix: str) -> Path:
-    """Return checkpoint manager directory for a run prefix."""
+    """Return checkpoint directory for a run prefix."""
     return Path(ckpt_dir) / prefix
 
 
-def _create_manager(
+
+def _checkpoint_path(ckpt_dir: str, prefix: str, step: int) -> Path:
+    """Checkpoint file path for a given step."""
+    return _manager_directory(ckpt_dir, prefix) / f"checkpoint_{step}.pt"
+
+
+
+def _cleanup_old_checkpoints(
     ckpt_dir: str,
     prefix: str,
-    max_to_keep: int = 5,
-) -> ocp.CheckpointManager:
-    """Create a configured Orbax checkpoint manager."""
-    manager_dir = _manager_directory(ckpt_dir, prefix)
-    manager_dir.mkdir(parents=True, exist_ok=True)
+    max_to_keep: int,
+) -> None:
+    """Keep only the newest max_to_keep checkpoints."""
+    ckpt_dir_path = _manager_directory(ckpt_dir, prefix)
 
-    options = ocp.CheckpointManagerOptions(
-        create=True,
-        max_to_keep=max_to_keep,
+    checkpoints = sorted(
+        ckpt_dir_path.glob("checkpoint_*.pt"),
+        key=lambda p: int(p.stem.split("_")[-1]),
     )
-    # ✅ refactored API
-    return ocp.CheckpointManager(manager_dir, options=options)
+
+    excess = len(checkpoints) - max_to_keep
+    if excess > 0:
+        for ckpt in checkpoints[:excess]:
+            ckpt.unlink(missing_ok=True)
+
 
 
 def save_train_state(
@@ -39,26 +47,58 @@ def save_train_state(
 ) -> None:
     """Save training state at a given step."""
     step = int(step)
-    with _create_manager(ckpt_dir, prefix, max_to_keep=max_to_keep) as manager:
-        manager.save(step, args=ocp.args.StandardSave(state))
-        manager.wait_until_finished()
+
+    save_dir = _manager_directory(ckpt_dir, prefix)
+    save_dir.mkdir(parents=True, exist_ok=True)
+
+    ckpt_path = _checkpoint_path(ckpt_dir, prefix, step)
+
+    torch.save(state, ckpt_path)
+
+    _cleanup_old_checkpoints(
+        ckpt_dir,
+        prefix,
+        max_to_keep=max_to_keep,
+    )
+
 
 
 def load_train_state(
-    target_state: Any,
     ckpt_dir: str,
     prefix: str,
     step: Optional[int] = None,
-    max_to_keep: int = 5,
+    map_location: str | torch.device = "cpu",
 ) -> Any:
-    """Restore training state from a checkpoint step (or latest when omitted)."""
-    with _create_manager(ckpt_dir, prefix, max_to_keep=max_to_keep) as manager:
-        if step is None:
-            step = manager.latest_step()
-            if step is None:
-                raise FileNotFoundError(
-                    f"No checkpoints found in '{_manager_directory(ckpt_dir, prefix)}'."
-                )
-        step = int(step)
+    """Restore training state from a checkpoint step or latest."""
+    ckpt_dir_path = _manager_directory(ckpt_dir, prefix)
 
-        return manager.restore(step, args=ocp.args.StandardRestore(target_state))
+    if not ckpt_dir_path.exists():
+        raise FileNotFoundError(
+            f"No checkpoints found in '{ckpt_dir_path}'."
+        )
+
+    if step is None:
+        checkpoints = sorted(
+            ckpt_dir_path.glob("checkpoint_*.pt"),
+            key=lambda p: int(p.stem.split("_")[-1]),
+        )
+
+        if not checkpoints:
+            raise FileNotFoundError(
+                f"No checkpoints found in '{ckpt_dir_path}'."
+            )
+
+        ckpt_path = checkpoints[-1]
+    else:
+        ckpt_path = _checkpoint_path(ckpt_dir, prefix, int(step))
+
+        if not ckpt_path.exists():
+            raise FileNotFoundError(
+                f"Checkpoint step {step} not found: '{ckpt_path}'."
+            )
+
+    return torch.load(
+        ckpt_path,
+        map_location=map_location,
+        weights_only=False,
+    )

@@ -109,9 +109,10 @@ def _run_cfo_eval(method, state: TrainState, epoch: int, eval_dataset, logger: E
         )
     state.model.train()
 
-    rel_fro_value = relative_frobenius_error(target_eval, pred_eval)
-    rmse_value = rmse(target_eval, pred_eval)
-    rel_l2_value = relative_L2_error(target_eval, pred_eval)
+    target_np = target_eval.detach().cpu().numpy()
+    rel_fro_value = relative_frobenius_error(target_np, pred_eval)
+    rmse_value = rmse(target_np, pred_eval)
+    rel_l2_value = relative_L2_error(target_np, pred_eval)
 
     logger.log(
         {
@@ -210,11 +211,11 @@ def train_cfo(method, spline_dataloader, args: CFOTrainArgs, eval_dataset: Optio
             should_save_running_interval = should_save_running_interval or (args.running_ckpt_dir is not None)
             if rel_l2_value < best_l2_error:
                 best_l2_error = rel_l2_value
-                best_state = state
+                best_state = copy.deepcopy(state.model.state_dict())
                 best_epoch = epoch
                 if args.best_ckpt_dir is not None:
                     save_train_state(
-                        best_state,
+                        state,
                         args.best_ckpt_dir,
                         prefix=args.best_ckpt_prefix,
                         step=epoch,
@@ -251,157 +252,7 @@ def train_cfo(method, spline_dataloader, args: CFOTrainArgs, eval_dataset: Optio
     }
 
 
-def _prepare_ar_train_batch(method, raw_batch, device: str):
-    if method.use_time:
-        x, y, t, *_ = raw_batch
-        return (x.to(device), y.to(device), t.to(device))
-    x, y, *_ = raw_batch
-    return (x.to(device), y.to(device))
 
 
-def _run_ar_eval(method, state: TrainState, epoch: int, eval_dataset, logger: ExperimentLogger, device: str):
-    x0_eval, target_eval = eval_dataset
-    x0_eval = torch.as_tensor(x0_eval, dtype=torch.float32, device=device)
-    target_eval = torch.as_tensor(target_eval, dtype=torch.float32, device=device)
 
-    state.model.eval()
-    with torch.no_grad():
-        pred_eval = method.inference(state.model, x0_eval)
-    state.model.train()
-
-    rel_fro_value = relative_frobenius_error(target_eval, pred_eval)
-    rmse_value = rmse(target_eval, pred_eval)
-    rel_l2_value = relative_L2_error(target_eval, pred_eval)
-
-    logger.log(
-        {
-            "eval/epoch": epoch,
-            "eval/Relative_L2_Error": rel_l2_value,
-            "eval/RMSE": rmse_value,
-            "eval/Relative_Frobenius_Error": rel_fro_value,
-        },
-        commit=False,
-    )
-    return float(rel_l2_value), float(rmse_value), float(rel_fro_value)
-
-
-def init_ar_train_state(
-    method,
-    *,
-    seed: int,
-    learning_rate: float = 1e-3,
-    beta1: float = 0.9,
-    beta2: float = 0.99,
-    device: str = "cuda" if torch.cuda.is_available() else "cpu",
-) -> TrainState:
-    torch.manual_seed(seed)
-    model = method.model.to(device)
-
-    x = torch.ones((1,) + tuple(method.input_shape), dtype=torch.float32, device=device)
-    with torch.no_grad():
-        if method.use_time:
-            t = torch.ones((1,), dtype=torch.float32, device=device)
-            model(x, t)
-        else:
-            model(x)
-
-    optimizer = torch.optim.Adam(
-        model.parameters(), lr=float(learning_rate), betas=(float(beta1), float(beta2))
-    )
-    return TrainState(model=model, optimizer=optimizer)
-
-
-def train_ar(method, dataloader, args: ARTrainArgs, eval_dataset: Optional[Tuple[np.ndarray, np.ndarray]] = None):
-    device = args.device
-    state = init_ar_train_state(
-        method,
-        seed=args.random_seed,
-        learning_rate=args.learning_rate,
-        beta1=args.beta1,
-        beta2=args.beta2,
-        device=device,
-    )
-    loss_fn = method.loss_fn
-
-    def ar_train_step(state: TrainState, batch):
-        state.optimizer.zero_grad(set_to_none=True)
-        loss = loss_fn(state.model, batch)
-        loss.backward()
-        state.apply_gradients()
-        return loss.detach(), state
-
-    logger = ExperimentLogger.create(
-        use_wandb=args.use_wandb,
-        log_mode=args.log_mode,
-        train_log_interval=args.train_log_interval,
-        console=args.console_logging,
-    )
-    num_params = sum(p.numel() for p in state.model.parameters())
-    logger.info(f"Model parameters: {int(num_params)}")
-
-    pbar = trange(args.num_epochs, desc="Training")
-    data = map(prepare_torch_data, dataloader)
-    data_iter = iter(data)
-
-    loss_log: list[float] = []
-    best_state = state
-    best_l2_error = float("inf")
-    best_epoch = -1
-
-    for epoch in pbar:
-        batch = _prepare_ar_train_batch(method, next(data_iter), device)
-        loss, state = ar_train_step(state, batch)
-
-        should_save_running_interval = (
-            args.running_ckpt_dir is not None
-            and args.running_ckpt_interval > 0
-            and (epoch + 1) % args.running_ckpt_interval == 0
-        )
-
-        if args.do_eval and (epoch % args.eval_interval == 0) and epoch > 0 and eval_dataset is not None:
-            rel_l2_value, rmse_value, rel_fro_value = _run_ar_eval(method, state, epoch, eval_dataset, logger, device)
-            should_save_running_interval = should_save_running_interval or (args.running_ckpt_dir is not None)
-            if rel_l2_value < best_l2_error:
-                best_l2_error = rel_l2_value
-                best_state = state
-                best_epoch = epoch
-                if args.best_ckpt_dir is not None:
-                    save_train_state(
-                        best_state,
-                        args.best_ckpt_dir,
-                        prefix=args.best_ckpt_prefix,
-                        step=epoch,
-                        max_to_keep=1,
-                    )
-                logger.info(
-                    f"[eval] epoch={epoch} rel_l2={rel_l2_value:.6f} rmse={rmse_value:.6f} rel_fro={rel_fro_value:.6f} [BEST]"
-                )
-            else:
-                logger.info(
-                    f"[eval] epoch={epoch} rel_l2={rel_l2_value:.6f} rmse={rmse_value:.6f} rel_fro={rel_fro_value:.6f}"
-                )
-
-        if should_save_running_interval:
-            save_train_state(
-                state,
-                args.running_ckpt_dir,
-                prefix=args.running_ckpt_prefix,
-                step=epoch,
-                max_to_keep=args.running_ckpt_max_to_keep,
-            )
-
-        loss_value = float(loss)
-        loss_log.append(loss_value)
-        pbar.set_postfix({"loss": loss_value})
-    print("Training complete.")
-
-    return {
-        "state": state,
-        "best_state": best_state,
-        "best_l2_error": best_l2_error,
-        "best_epoch": best_epoch,
-        "loss_log": loss_log,
-    }
-
-
-__all__ = ["train_cfo", "train_ar", "CFOTrainArgs", "ARTrainArgs", "TrainState"]
+__all__ = ["train_cfo", "CFOTrainArgs", "TrainState"]
