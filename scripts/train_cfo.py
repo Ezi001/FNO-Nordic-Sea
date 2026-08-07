@@ -20,7 +20,7 @@ from cfo_torch import ContinuousFlowOperator
 from models.factory import build_model
 from train_torch import CFOTrainArgs, train_cfo
 from utils.data_torch import build_dataloader, linear_spline, quintic_spline_batch
-from utils.dataset_loaders import load_dataset_splits
+from utils.readers import load_dataset_splits
 from utils.metrics import relative_L2_error, relative_frobenius_error, rmse
 from utils.seed import set_global_seed
 
@@ -72,6 +72,7 @@ def _build_spline_dataset(train_data, spline_type, cond, batch_size, spline_batc
             np.linspace(0.0, 1.0, traj_len, dtype=train_data.dtype),
             (batch_n, traj_len),
         )
+
 
     if spline_type == "linear":
         spline_coef, start_time, end_time = linear_spline(train_data, time=time)
@@ -134,6 +135,7 @@ def main() -> None:
     train_state, train_forcing = splits["train"]
     eval_state, eval_forcing = splits["eval"]
     test_state, test_forcing = splits["test"]
+    norm_stats = splits.get("normalization")
     """state, forcing = load_nordic_seas_data(args.dataset_path)
 
     state_traj = build_trajectories(

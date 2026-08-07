@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import itertools
-from typing import Iterator, Optional
+from typing import Iterator
 
 import numpy as np
 import torch
@@ -147,15 +147,6 @@ def build_dataloader(X, t1=None, t2=None, c=None, y=None, batch_size=64, num_epo
     return _RepeatingLoader(loader, num_epochs=num_epochs)
 
 
-def autoregressive_dataset(data):
-    """Build one-step `(x_t, x_{t+1})` pairs from trajectory data."""
-    B, T, *spatial = data.shape
-    windows = sliding_window_view(data, window_shape=2, axis=1)
-    x = windows[..., 0]
-    y = windows[..., 1]
-    x_flat = x.reshape(-1, *spatial)
-    y_flat = y.reshape(-1, *spatial)
-    return x_flat, y_flat
 
 
 def load_partial_data(data, ratio, seed=43):
@@ -201,7 +192,6 @@ __all__ = [
     "CudaPrefetcher",
     "tree_to_device",
     "build_dataloader",
-    "autoregressive_dataset",
     "load_partial_data",
     "select_data_split",
     "linear_spline",

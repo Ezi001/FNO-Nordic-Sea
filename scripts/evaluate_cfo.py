@@ -18,7 +18,7 @@ if str(PROJECT_ROOT) not in sys.path:
 
 from cfo_torch import ContinuousFlowOperator
 from models.factory import build_model
-from utils.dataset_loaders import load_dataset_splits
+from utils.readers_nordic import load_dataset_splits
 from train_torch import init_cfo_train_state
 from utils.checkpoints import load_train_state
 from utils.data_torch import select_data_split
@@ -33,7 +33,7 @@ def parse_args() -> argparse.Namespace:
         "--dataset",
         type=str,
         required=True,
-        choices=["lorenz", "burgers", "dr", "swe"],
+        choices=["nordic"],
         help="Dataset name",
     )
     parser.add_argument("--dataset-path", type=str, default=None, help="Optional dataset file path override")
