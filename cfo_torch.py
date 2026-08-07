@@ -21,26 +21,26 @@ class ContinuousFlowOperator:
         input_shape: Sequence[int],
         gamma: float = 1e-5,
         spline_type: str = "quintic",
-        use_condition: bool = True,
-        condition_shape: Sequence[int] | None = None,
+        use_forcing: bool = True,
+        forcing_shape: Sequence[int] | None = None,
     ):
         self.model = model
         self.input_shape = tuple(input_shape)
         self.gamma = float(gamma)
-        self.use_condition = bool(use_condition)
-        self.condition_shape = tuple(condition_shape) if condition_shape is not None else None
+        self.use_forcing = bool(use_forcing)
+        self.forcing_shape = tuple(forcing_shape) if forcing_shape is not None else None
         self.spline_type = str(spline_type)
         if self.spline_type not in {"linear", "quintic"}:
             raise ValueError("`spline_type` must be one of {'linear', 'quintic'}.")
-        if self.use_condition and self.condition_shape is None:
-            raise ValueError("`condition_shape` must be provided when `use_condition=True`.")
+        if self.use_forcing and self.forcing_shape is None:
+            raise ValueError("`forcing_shape` must be provided when `use_forcing=True`.")
 
     @staticmethod
     def _reshape_time_like(x: Tensor, spline_coef: Tensor) -> Tensor:
         return x.reshape((x.shape[0],) + (1,) * (spline_coef.ndim - 2))
 
-    def _model_apply(self, x: Tensor, t: Tensor, condition: Tensor | None = None) -> Tensor:
-        return self.model(x, t, condition)
+    def _model_apply(self, x: Tensor, t: Tensor, forcing: Tensor | None = None) -> Tensor:
+        return self.model(x, t, forcing)
 
     def sample_conditional_path(
         self,
@@ -89,11 +89,18 @@ class ContinuousFlowOperator:
         ) + gamma_prime * eps
 
     def loss_fn(self, batch) -> Tensor:
-        if self.use_condition:
-            spline_coef, condition, t_start, t_end, delta_t, eps = batch
+        if self.use_forcing:
+            (
+                spline_coef,
+                forcing,
+                t_start,
+                t_end,
+                delta_t,
+                eps,
+            ) = batch
         else:
             spline_coef, t_start, t_end, delta_t, eps = batch
-            condition = None
+            forcing = None
 
         dt = t_end - t_start
         tau = delta_t / dt
@@ -101,50 +108,50 @@ class ContinuousFlowOperator:
         dt = self._reshape_time_like(dt, spline_coef)
 
         x = self.sample_conditional_path(tau, spline_coef, eps, dt)
-        outputs = self._model_apply(x, t_start + delta_t, condition)
+        outputs = self._model_apply(x, t_start + delta_t, forcing)
         targets = self.compute_targets(spline_coef, tau, dt, eps)
         return torch.mean((outputs - targets) ** 2)
 
-    def _velocity(self, x: Tensor, t: Tensor, condition: Tensor | None = None) -> Tensor:
+    def _velocity(self, x: Tensor, t: Tensor, forcing: Tensor | None = None) -> Tensor:
         if not torch.is_tensor(t):
             t = torch.as_tensor(t, device=x.device, dtype=x.dtype)
         if t.ndim == 0:
             t = torch.full((x.shape[0],), t.item(), device=x.device, dtype=x.dtype)
-        return self._model_apply(x, t, condition)
+        return self._model_apply(x, t, forcing)
 
     def _euler_step(
         self,
         x: Tensor,
         t: Tensor,
-        condition: Tensor | None,
+        forcing: Tensor | None,
         delta_t: Tensor,
     ) -> Tensor:
-        return x + delta_t * self._velocity(x, t, condition)
+        return x + delta_t * self._velocity(x, t, forcing)
 
     def _heun_step(
         self,
         x: Tensor,
         t: Tensor,
-        condition: Tensor | None,
+        forcing: Tensor | None,
         delta_t: Tensor,
     ) -> Tensor:
-        k1 = self._velocity(x, t, condition)
+        k1 = self._velocity(x, t, forcing)
         x_pred = x + delta_t * k1
-        k2 = self._velocity(x_pred, t + delta_t, condition)
+        k2 = self._velocity(x_pred, t + delta_t, forcing)
         return x + 0.5 * delta_t * (k1 + k2)
 
     def _rk4_step(
         self,
         x: Tensor,
         t: Tensor,
-        condition: Tensor | None,
+        forcing: Tensor | None,
         delta_t: Tensor,
     ) -> Tensor:
         half_dt = 0.5 * delta_t
-        k1 = self._velocity(x, t, condition)
-        k2 = self._velocity(x + half_dt * k1, t + half_dt, condition)
-        k3 = self._velocity(x + half_dt * k2, t + half_dt, condition)
-        k4 = self._velocity(x + delta_t * k3, t + delta_t, condition)
+        k1 = self._velocity(x, t, forcing)
+        k2 = self._velocity(x + half_dt * k1, t + half_dt, forcing)
+        k3 = self._velocity(x + half_dt * k2, t + half_dt, forcing)
+        k4 = self._velocity(x + delta_t * k3, t + delta_t, forcing)
         return x + (delta_t / 6.0) * (k1 + 2.0 * k2 + 2.0 * k3 + k4)
 
     def infer_at(
@@ -153,7 +160,7 @@ class ContinuousFlowOperator:
         s: float,
         t: float,
         steps: int = 50,
-        condition: Tensor | None = None,
+        forcing: Tensor | None = None,
         method: str = "RK4",
     ) -> Tensor:
         step_fns = {
@@ -172,7 +179,7 @@ class ContinuousFlowOperator:
         x = x_at_s
         for i in range(steps - 1):
             t_batch = torch.full((x.shape[0],), t_values[i].item(), device=x.device, dtype=x.dtype)
-            x = step_fn(x, t_batch, condition, delta_t)
+            x = step_fn(x, t_batch, forcing, delta_t)
         return x
 
     @torch.no_grad()
@@ -181,7 +188,7 @@ class ContinuousFlowOperator:
         x_0: Tensor,
         trajectory_points_num: int,
         steps_per_segment: int = 3,
-        condition: Tensor | None = None,
+        forcing: Tensor | None = None,
         method: str = "RK4",
     ) -> np.ndarray:
         was_training = self.model.training
@@ -197,19 +204,19 @@ class ContinuousFlowOperator:
                 s = idx * segment_dt
                 t = (idx + 1) * segment_dt
 
-                if condition is None:
-                    condition_i = None
-                elif condition.ndim == 5:
-                    condition_i = condition[:, idx]
+                if forcing is None:
+                    forcing_i = None
+                elif forcing.ndim == 5:
+                    forcing_i = forcing[:, idx]
                 else:
-                    condition_i = condition
+                    forcing_i = forcing
 
                 x = self.infer_at(
                     x,
                     s=s,
                     t=t,
                     steps=segment_steps + 1,
-                    condition=condition_i,
+                    forcing=forcing_i,
                     method=method,
                 )
                 preds.append(x.detach().cpu().numpy())
@@ -218,3 +225,4 @@ class ContinuousFlowOperator:
             return np.swapaxes(pred, 0, 1)
         finally:
             self.model.train(was_training)
+
