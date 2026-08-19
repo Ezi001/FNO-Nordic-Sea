@@ -17,7 +17,7 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from cfo_torch import ContinuousFlowOperator
-from models.factory import build_model
+from models.factory_torch import build_model
 from utils.readers_nordic import load_dataset_splits
 from train_torch import init_cfo_train_state
 from utils.checkpoints import load_train_state

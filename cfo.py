@@ -2,17 +2,18 @@ from __future__ import annotations
 
 from typing import Sequence
 
+import jax.numpy as jnp
 import numpy as np
-import torch
-from torch import Tensor, nn
+from flax import linen as nn
+from jax.experimental.ode import odeint
 
 from utils.integrators import INTEGRATOR_STEP_FNS
 
 
 class ContinuousFlowOperator:
-    """Algorithm-only CFO definition for PyTorch.
+    """Algorithm-only CFO definition.
 
-    This class contains only CFO math/algorithm logic and inference calls.
+    This class contains only CFO math/algorithm logic and stateless inference calls.
     State creation, optimization, training loops, and checkpointing are handled outside.
     """
 
@@ -23,7 +24,7 @@ class ContinuousFlowOperator:
         input_shape: Sequence[int],
         gamma: float = 1e-5,
         spline_type: str = "quintic",
-        use_condition: bool = True,
+        use_condition: bool = False,
         condition_shape: Sequence[int] | None = None,
     ):
         self.model = model
@@ -38,19 +39,13 @@ class ContinuousFlowOperator:
             raise ValueError("`condition_shape` must be provided when `use_condition=True`.")
 
     @staticmethod
-    def _reshape_time_like(x: Tensor, spline_coef: Tensor) -> Tensor:
-        return x.reshape((x.shape[0],) + (1,) * (spline_coef.ndim - 2))
+    def _reshape_time_like(x: jnp.ndarray, spline_coef: jnp.ndarray) -> jnp.ndarray:
+        return jnp.reshape(x, (x.shape[0],) + (1,) * (spline_coef.ndim - 2))
 
-    def _model_apply(self, params, x: Tensor, t: Tensor, condition: Tensor | None = None) -> Tensor:
+    def _model_apply(self, params, x, t, condition=None):
         return self.model.apply({'params': params}, x, t, condition)
 
-    def sample_conditional_path(
-        self,
-        tau: Tensor,
-        spline_coef: Tensor,
-        eps: Tensor,
-        dt: Tensor | None = None,
-    ) -> Tensor:
+    def sample_conditional_path(self, tau, spline_coef, eps, dt=None):
         if dt is None:
             raise ValueError("`dt` must be provided to sample the conditional path.")
 
@@ -69,28 +64,19 @@ class ContinuousFlowOperator:
         gamma_t = self.gamma * (tau**3) * ((1.0 - tau) ** 3)
         return mu_t + gamma_t * eps
 
-    def compute_targets(
-        self,
-        spline_coef: Tensor,
-        tau: Tensor,
-        dt: Tensor,
-        eps: Tensor,
-    ) -> Tensor:
-        gamma_prime = self.gamma * (3.0 / dt) * (
-            tau**2 * (1.0 - tau) ** 2 * (1.0 - 2.0 * tau)
-        )
+    def compute_targets(self, spline_coef: jnp.ndarray, tau: jnp.ndarray, dt: jnp.ndarray, eps: jnp.ndarray) -> jnp.ndarray:
+        gamma_prime = self.gamma * (3.0 / dt) * (tau**2 * (1.0 - tau) ** 2 * (1.0 - 2.0 * tau))
         if self.spline_type == "linear":
-            return (1.0 / dt) * spline_coef[:, 1] + gamma_prime * eps
-
-        return (1.0 / dt) * (
+            return (1 / dt) * spline_coef[:, 1] + gamma_prime * eps
+        return (1 / dt) * (
             spline_coef[:, 1]
-            + 2.0 * spline_coef[:, 2] * tau
-            + 3.0 * spline_coef[:, 3] * tau**2
-            + 4.0 * spline_coef[:, 4] * tau**3
-            + 5.0 * spline_coef[:, 5] * tau**4
+            + 2 * spline_coef[:, 2] * tau
+            + 3 * spline_coef[:, 3] * tau**2
+            + 4 * spline_coef[:, 4] * tau**3
+            + 5 * spline_coef[:, 5] * tau**4
         ) + gamma_prime * eps
 
-    def loss_fn(self, params, batch) -> Tensor:
+    def loss_fn(self, params, batch):
         if self.use_condition:
             spline_coef, condition, t_start, t_end, delta_t, eps = batch
         else:
@@ -105,38 +91,33 @@ class ContinuousFlowOperator:
         x = self.sample_conditional_path(tau, spline_coef, eps, dt)
         outputs = self._model_apply(params, x, t_start + delta_t, condition)
         targets = self.compute_targets(spline_coef, tau, dt, eps)
-        return torch.mean((outputs - targets) ** 2)
+        return jnp.mean((outputs - targets) ** 2)
 
-    def infer_at(self, state, x_at_s: Tensor, s: float, t: float, steps: int = 50, condition: Tensor | None = None, method: str = "RK4") -> Tensor:
+    def infer_at(self, state, x_at_s, s, t, steps=50, condition=None, method="RK4"):
         if method not in INTEGRATOR_STEP_FNS:
             raise ValueError("method must be 'Euler', 'Heun', or 'RK4'.")
 
         step_fn = INTEGRATOR_STEP_FNS[method]
         steps = max(int(steps), 2)
-        delta_t = torch.as_tensor((t - s) / (steps - 1), device=x_at_s.device, dtype=x_at_s.dtype)
-        t_values = torch.linspace(s, t, steps, device=x_at_s.device, dtype=x_at_s.dtype)
+        delta_t = (t - s) / (steps - 1)
+        t_values = jnp.linspace(s, t, steps)
 
         x = x_at_s
         for i in range(steps - 1):
-            t_batch = torch.full((x.shape[0],), t_values[i].item(), device=x.device, dtype=x.dtype)
+            t_batch = jnp.full((x.shape[0],), t_values[i])
             x = step_fn(state, x, t_batch, condition, delta_t)
         return x
-
-    @torch.no_grad()
-    def uniform_inference(self, state, x_0: Tensor, trajectory_points_num: int, steps_per_segment: int = 3, condition: Tensor | None = None, method: str = "RK4") -> np.ndarray:
-        # was_training = self.model.training
-        # self.model.eval()
-        
+    
+    def uniform_inference(self, state, x_0, trajectory_points_num: int, steps_per_segment=3, condition=None, method="RK4"):
         points_num = int(trajectory_points_num)
         segment_steps = max(int(steps_per_segment), 1)
         segment_dt = 1.0 / max(points_num - 1, 1)
 
-        preds = [x_0.detach().cpu().numpy()]
+        preds = [np.array(x_0)]
         x = x_0
         for idx in range(points_num - 1):
             s = idx * segment_dt
             t = (idx + 1) * segment_dt
-
             x = self.infer_at(
                 state,
                 x,
@@ -146,9 +127,9 @@ class ContinuousFlowOperator:
                 condition=condition,
                 method=method,
             )
-            preds.append(x.detach().cpu().numpy())
+            preds.append(np.array(x))
 
         pred = np.stack(preds, axis=0)
         return np.swapaxes(pred, 0, 1)
-        # finally:
-        #     self.model.train(was_training)
+
+    

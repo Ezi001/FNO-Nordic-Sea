@@ -17,10 +17,10 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from cfo_torch import ContinuousFlowOperator
-from models.factory import build_model
+from models.factory_torch import build_model
 from train_torch import CFOTrainArgs, train_cfo
 from utils.data_torch import build_dataloader, linear_spline, quintic_spline_batch
-from utils.readers import load_dataset_splits
+from utils.readers_nordic import load_dataset_splits
 from utils.metrics import relative_L2_error, relative_frobenius_error, rmse
 from utils.seed import set_global_seed
 
@@ -175,8 +175,8 @@ def main() -> None:
     model = build_model(args.model, 
                         input_shape, 
                         use_condition=use_condition,
-                        condition_shape=tuple(train_forcing.shape[2:]),
-                        )
+                        condition_shape=tuple(train_forcing.shape[2:])
+    )
 
     task_desc = "partial snapshots" if args.partial_train_ratio < 1.0 else "full trajectories"
     print("=== TASK SUMMARY ===")

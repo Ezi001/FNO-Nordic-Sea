@@ -1,4 +1,9 @@
 """
+Preprocessing file
+
+Name: Esther Zijerveld
+Date: 18-08-2026
+
 Necessary imports
 """
 import xarray as xr
@@ -29,12 +34,12 @@ print(forcing.lon.min().item(), forcing.lon.max().item())
 print(float(lon_min), float(lon_max))
 
 if forcing.lon.max() > 180 and lon_min < 0:
-    raise ValueError(
-        "ERA5 uses 0-360 longitude while NEMO uses -180-180."
-    )
+    forcing = forcing.assign_coords(
+        lon=((forcing.lon + 180) % 360) - 180
+    ).sortby("lon")
 
 """
-Downsample to 6-hourly
+Downsample to 6-hourly time-resolution
 
 """
 ssh_6h = nemo_ssh["ssh"].isel(time=slice(None, None, 6))
@@ -101,11 +106,15 @@ vbar_masked = vbar_t.where(mask, other=0).assign_coords(
 target_lat = nemo_ssh["nav_lat"]
 target_lon = nemo_ssh["nav_lon"]
 
-# Interpolation from atmospheric data to sea surface height grid
+"""
+Interpolation from atmospheric data to sea surface height grid
+"""
 forcing_on_ssh = era5_crop.interp(
     lat=target_lat,
     lon=target_lon,
 )
+print("before operations.")
+print(forcing_on_ssh.coords)
 
 forcing_tensor = xr.concat(
     [
