@@ -7,7 +7,6 @@ import os
 from pathlib import Path
 import sys
 import numpy as np
-import torch
 
 os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "3")
 os.environ.setdefault("ABSL_MIN_LOG_LEVEL", "3")
@@ -16,6 +15,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
+from utils.readers_nordic import load_dataset_splits
 from cfo_torch import ContinuousFlowOperator
 from models.factory_torch import build_model
 from train_torch import CFOTrainArgs, train_cfo
@@ -23,10 +23,6 @@ from utils.data_torch import build_dataloader, linear_spline, quintic_spline_bat
 from utils.readers_nordic import load_dataset_splits
 from utils.metrics import relative_L2_error, relative_frobenius_error, rmse
 from utils.seed import set_global_seed
-
-#window = 728      # six months @ 6hr
-#stride = 364
-# (B, T_window, H, W, 3)
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Train CFO model")
@@ -43,17 +39,19 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--gamma", type=float, default=1e-5)
 
     # data / model
-    parser.add_argument("--dataset", type=str, default="nordic sea", choices=["nordic sea"])
-    parser.add_argument("--dataset-path", type=str, default=None)
+    parser.add_argument("--dataset", type=str, default="nordic", choices=["nordic"])
     parser.add_argument("--model", type=str, default="FNO2d", choices=["FNO2d"])
     parser.add_argument("--spline-type", type=str, default="quintic", choices=["linear", "quintic"])
     parser.add_argument("--spline-batch-size", type=int, default=32, help="Batch size used only for spline coefficient construction")
     parser.add_argument("--partial-train-ratio", type=float, default=1.0, help="Fraction of training time snapshots used to build splines")
+    parser.add_argument("--trajectory-window", type=int, default=728, help="Window length")
+    parser.add_argument("--stride", type=int, default=364, help="The window stride")
+    parser.add_argument("--normalize", action="store_true", help="If we are normalising")
 
     # evaluation / checkpointing
     parser.add_argument("--eval-interval", type=int, default=5000)
     parser.add_argument("--ckpt-dir", type=str, default="checkpoints")
-    parser.add_argument("--ckpt-prefix", type=str, default="cfo_nordic")
+    parser.add_argument("--ckpt-prefix", type=str, default="cfo_nordic  ")
     parser.add_argument("--running-ckpt-interval", type=int, default=None, help="Save running checkpoint every N epochs; defaults to eval-interval")
     parser.add_argument("--running-ckpt-max-to-keep", type=int, default=3, help="Number of running checkpoints to keep")
 
@@ -63,8 +61,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--dry-run", action="store_true", help="Print config and exit")
     return parser.parse_args()
 
-
-def _build_spline_dataset(train_data, spline_type, cond, batch_size, spline_batch_size, epochs, seed, time=None):
+def _build_spline_dataset(train_data, spline_type, forcing, batch_size, spline_batch_size, epochs, seed, time=None):
     batch_n, traj_len = train_data.shape[:2]
 
     if time is None:
@@ -97,19 +94,20 @@ def _build_spline_dataset(train_data, spline_type, cond, batch_size, spline_batc
 
     # simplest forcing choice: use forcing at segment start
     # cond: (B, T, H, W, C_forcing)
-    cond = cond[:, :-1].reshape(N, *cond.shape[2:])
+    forcing = forcing[:, :-1].reshape(N, *forcing.shape[2:])
     #cond = cond
+ 
 
     return build_dataloader(
         spline_coef,
         t1=start_time,
         t2=end_time,
-        c=cond,
+        c=forcing,
         batch_size=batch_size,
         num_epochs=epochs,
         seed=seed,
     )
-
+    
 def main() -> None:
     args = parse_args()
     set_global_seed(args.seed)
@@ -122,54 +120,20 @@ def main() -> None:
         print(args)
         return
 
-    """
-    Loading train/eval/test splits of nordic sea dataset
-    """
-    splits = load_dataset_splits("nordic",
-        processed_dir="processed",
-        trajectory_window=728,
-        stride=1,
-        normalize=True,
+    splits = load_dataset_splits(
+        dataset=args.dataset,
+        trajectory_window=args.trajectory_window,
+        stride=args.stride,
+        normalize=args.normalize,
     )
 
     train_state, train_forcing = splits["train"]
     eval_state, eval_forcing = splits["eval"]
     test_state, test_forcing = splits["test"]
-    norm_stats = splits.get("normalization")
-    """state, forcing = load_nordic_seas_data(args.dataset_path)
-
-    state_traj = build_trajectories(
-            state,
-            window_size=168,
-            stride=84,
-    ) # (B, 728, H, W, 3)
-    
-    forcing_traj = build_trajectories(
-        forcing,
-        window_size=168,
-        stride=84,
-    )
-    
-    n = len(state_traj)
-
-    train_end = int(0.7 * n)
-    eval_end = int(0.85 * n)
-
-    # split train/eval/test
-    train_state = state_traj[:train_end]
-    eval_state = state_traj[train_end:eval_end]
-    test_state = state_traj[eval_end:]
-
-    train_forcing = forcing_traj[:train_end]
-    eval_forcing = forcing_traj[train_end:eval_end]
-    test_forcing = forcing_traj[eval_end:]"""
-
 
     train_time = None
     if args.partial_train_ratio < 1.0:
-        print("disabled")
-        #train_state, train_time = load_partial_data(train_state, ratio=args.partial_train_ratio, seed=args.seed)
-        #train_forcing, train_time = load_partial_data(train_forcing, ratio=args.partial_train_ratio, seed=args.seed)
+        train_state, train_time = load_partial_data(train_state, ratio=args.partial_train_ratio, seed=args.seed)
 
     input_shape = tuple(train_state.shape[2:]) # (H, W, 3)
     model = build_model(args.model, 
@@ -196,26 +160,26 @@ def main() -> None:
     print(f"checkpoint_policy running_every={running_ckpt_interval} keep={args.running_ckpt_max_to_keep} best_keep=1")
 
     print("Preparing spline dataloader...")
-
+    
     spline_loader = _build_spline_dataset(
         train_data=train_state,
-        cond = train_forcing,
+        forcing=train_forcing,
         spline_type=args.spline_type,
         batch_size=args.batch_size,
         spline_batch_size=args.spline_batch_size,
         epochs=args.epochs,
         seed=args.seed,
-        time=train_time,
     )
+    spline_loader = CudaPrefetcher(spline_loader, device="cuda")
     print("Spline construction complete. Starting training...")
 
     method = ContinuousFlowOperator(
         model=model,
         input_shape=input_shape,
-        gamma=float(args.gamma),
+        gamma = args.gamma,
         spline_type=args.spline_type,
-        use_condition=use_condition,
-        condition_shape=tuple(train_forcing.shape[2:])
+        forcing_shape=train_forcing.shape[2:],
+        use_forcing=True,
     )
     train_args = CFOTrainArgs(
         num_epochs=args.epochs,
@@ -233,27 +197,30 @@ def main() -> None:
         running_ckpt_max_to_keep=args.running_ckpt_max_to_keep,
         best_ckpt_dir=str((Path(args.ckpt_dir).resolve() / "best")),
         best_ckpt_prefix=args.ckpt_prefix,
-    )
+    ) 
 
-    eval_dataset = (
-        eval_state[:,0],
-        eval_state,
-        eval_forcing
-    )
+    eval_dataset = (eval_state[:, 0], eval_state, eval_forcing)
     print("Starting training loop...")
     train_output = train_cfo(method, spline_loader, train_args, eval_dataset=eval_dataset)
 
+    state_for_test = train_output["state"]
+    if np.isfinite(train_output["best_l2_error"]):
+        state_for_test = train_output["best_state"]
+
     print("Running final test inference...")
-    test_pred = method.uniform_inference(
-        x_0=torch.as_tensor(test_state[:, 0], dtype=torch.float32),
+    x0 = test_state[:,0]
+
+    forcing = test_forcing
+    method.model.load_state_dict(state_for_test)
+    prediction = method.uniform_inference(
+        x0,
         trajectory_points_num=test_state.shape[1],
-        steps_per_segment=2,
-        condition=torch.as_tensor(test_forcing, dtype=torch.float32),
-        method="RK4",
+        forcing=forcing,
     )
-    test_rmse = rmse(test_state, test_pred)
-    test_rel_l2 = relative_L2_error(test_state, test_pred)
-    test_rel_fro = relative_frobenius_error(test_state, test_pred)
+
+    test_rmse = rmse(test_state, prediction)
+    test_rel_l2 = relative_L2_error(test_state, prediction)
+    test_rel_fro = relative_frobenius_error(test_state, prediction)
 
     best_epoch = train_output["best_epoch"]
     best_rel_l2 = train_output["best_l2_error"]

@@ -23,19 +23,19 @@ class ContinuousFlowOperator:
         input_shape: Sequence[int],
         gamma: float = 1e-5,
         spline_type: str = "quintic",
-        use_condition: bool = True,
-        condition_shape: Sequence[int] | None = None,
+        use_forcing: bool = True,
+        forcing_shape: Sequence[int] | None = None,
     ):
         self.model = model
         self.input_shape = tuple(input_shape)
         self.gamma = float(gamma)
-        self.use_condition = bool(use_condition)
-        self.condition_shape = tuple(condition_shape) if condition_shape is not None else None
+        self.use_forcing = bool(use_forcing)
+        self.forcing_shape = tuple(forcing_shape) if forcing_shape is not None else None
         self.spline_type = str(spline_type)
         if self.spline_type not in {"linear", "quintic"}:
             raise ValueError("`spline_type` must be one of {'linear', 'quintic'}.")
-        if self.use_condition and self.condition_shape is None:
-            raise ValueError("`condition_shape` must be provided when `use_condition=True`.")
+        if self.use_forcing and self.forcing_shape is None:
+            raise ValueError("`forcing_shape` must be provided when `use_forcing=True`.")
 
     @staticmethod
     def _reshape_time_like(x: Tensor, spline_coef: Tensor) -> Tensor:
@@ -95,7 +95,7 @@ class ContinuousFlowOperator:
             spline_coef, condition, t_start, t_end, delta_t, eps = batch
         else:
             spline_coef, t_start, t_end, delta_t, eps = batch
-            condition = None
+            forcing = None
 
         dt = t_end - t_start
         tau = delta_t / dt

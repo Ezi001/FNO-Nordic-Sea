@@ -67,10 +67,10 @@ def _prepare_cfo_train_batch(method, raw_batch, generator: torch.Generator, devi
     # NOTE: unlike the JAX version, there's no leading device-shard dimension here
     # (that came from pmap-style prefetch_to_device), so we don't index [0].
     if method.use_condition:
-        spline_coef, t_start, t_end, condition, *_ = raw_batch
+        spline_coef, t_start, t_end, forcing, *_ = raw_batch
     else:
         spline_coef, t_start, t_end, *_ = raw_batch
-        condition = None
+        forcing = None
 
     spline_coef = spline_coef.to(device)
     t_start = t_start.to(device)
@@ -82,18 +82,18 @@ def _prepare_cfo_train_batch(method, raw_batch, generator: torch.Generator, devi
     eps = torch.randn(x0.shape, generator=generator, device=device)
 
     if method.use_condition:
-        condition = condition.to(device)
-        return (spline_coef, condition, t_start, t_end, delta_t, eps)
+        forcing = forcing.to(device)
+        return (spline_coef, forcing, t_start, t_end, delta_t, eps)
     return (spline_coef, t_start, t_end, delta_t, eps)
 
 
 def _run_cfo_eval(method, state: TrainState, epoch: int, eval_dataset, logger: ExperimentLogger, device: str):
     if method.use_condition:
-        x0_eval, target_eval, condition_eval = eval_dataset
-        condition_eval = torch.as_tensor(condition_eval, dtype=torch.float32, device=device)
+        x0_eval, target_eval, forcing_eval = eval_dataset
+        forcing_eval = torch.as_tensor(forcing_eval, dtype=torch.float32, device=device)
     else:
         x0_eval, target_eval = eval_dataset
-        condition_eval = None
+        forcing_eval = None
 
     x0_eval = torch.as_tensor(x0_eval, dtype=torch.float32, device=device)
     target_eval = torch.as_tensor(target_eval, dtype=torch.float32, device=device)
@@ -104,7 +104,7 @@ def _run_cfo_eval(method, state: TrainState, epoch: int, eval_dataset, logger: E
             x0_eval,
             trajectory_points_num=target_eval.shape[1],
             steps_per_segment=2,
-            condition=condition_eval,
+            forcing=forcing_eval,
             method="RK4",
         )
     state.model.train()
@@ -145,7 +145,7 @@ def init_cfo_train_state(
     t = torch.ones((1,), dtype=torch.float32, device=device)
     with torch.no_grad():
         if method.use_condition:
-            c = torch.ones((1,) + tuple(method.condition_shape), dtype=torch.float32, device=device)
+            c = torch.ones((1,) + tuple(method.forcing_shape), dtype=torch.float32, device=device)
             model(x, t, c)
         else:
             model(x, t)
@@ -255,4 +255,6 @@ def train_cfo(method, spline_dataloader, args: CFOTrainArgs, eval_dataset: Optio
 
 
 
-__all__ = ["train_cfo", "CFOTrainArgs", "TrainState"]
+__all__ = ["train_cfo", 
+"CFOTrainArgs", 
+"TrainState"]
