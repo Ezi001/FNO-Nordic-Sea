@@ -1,201 +1,542 @@
 """
-Precompute quintic-spline coefficients for the PDEBench 2D shallow-water dataset
-and store them in the Zarr layout expected by ZarrSplineDataset.
-
-For every trajectory, each pixel's time series (one value per snapshot) is
-interpolated with a quintic spline whose knots sit at t = 0, 1, ..., N-1.
-Every pair of consecutive snapshots therefore forms one spline interval.
-
-Output Zarr store
------------------
-spline_coef  : (n_trajectories, n_intervals, 6, H, W), float32
-spline_start : (n_trajectories, n_intervals),          float32
-spline_end   : (n_trajectories, n_intervals),          float32
-
-Coefficient convention:
-    u(t) = sum_k spline_coef[..., k, :, :] * (t - t_start) ** k,
-    for t in [t_start, t_end], with t_end - t_start = 1.
-So k = 0 is the value at the start of the interval and k = 5 is the quintic term.
-
-Train/test split indices are saved in the root attributes:
-    root.attrs["train_indices"], root.attrs["test_indices"]
-and reproduce the split of load_shallow_water_pdebench (same seed and shuffle).
-
-Usage
------
-python compute_splines_shallow_water_quintic.py \
-    --h5-path data/shallow_water/2D_rdb_NA_NA.h5 \
-    --zarr-path processed/shallow_water/splines_quintic.zarr
+This file is supposed to calculate the splines for the trajectories. 
+I am splitting the data into trajectories of 2 days with a stride of 2 days and 1 hour.
 """
+print(__doc__)
 
-import argparse
-import logging
+__author__ = "Esther Zijerveld"
+print(__author__)
 
-import h5py
+__version__="0.1"
+print(__version__)
+
+# Neccessary imports
+import time
+import sys
+
 import numpy as np
+import xarray as xr
 import zarr
 
-PROJECT_ROOT = Path(__file__).resolve().parents[1]
+from splines_torch import quintic_spline_batch
+from pathlib import Path
 
-if str(PROJECT_ROOT) not in sys.path:
-    sys.path.insert(0, str(PROJECT_ROOT))
+# Add the parent folder to the path
+sys.path.append(str(Path(__file__).resolve().parent.parent))
 
-from utils.splines_torch import quintic_spline_batch
+# Where the data is located
+DATA_DIR = "./data"
+OUTPUT_DIR = "./processed"
 
-logger = logging.getLogger(__name__)
+# trajectory length is 2 days
+# Number of trajectories will be 48.
+trajectory_length = 49
+stride = 49
 
-N_COEFFICIENTS = 6  # quintic spline
+#ds_ocean_preprocessed = xr.open_zarr(f"{DATA_DIR}/nemo_ocean.zarr")
+
+ds_ocean = xr.open_zarr(f"./{DATA_DIR}/nemo_ocean.zarr")
+#ds_forcing = xr.open_zarr(f"{DATA_DIR}/nemo_forcing.zarr")
+
+print(ds_ocean["time"].values)
+
+# Training from 2020/06/01 to 2021/12/31
+# Eval from 
+# Test from 2023/01/01 to 2024/12/31
+# Selecting the correct time period
+
+ssh_train = ds_ocean["ssh"].sel(
+    time=slice(
+        "2020-06-01",
+        "2022-12-31",
+    )
+)
+print(ssh_train["time"].values)
+
+print(ssh_train.ndim)
+
+# forcing_train = ds_forcing.sel(
+#     time=slice(
+#         "2020-06-01",
+#         "2021-12-31",
+#     )
+# )
+
+# print(forcing_train.shape)
+
+# forcing_train = (
+#     forcing_train[["u10", "v10", "msl"]]
+#     .to_array(dim="channel")
+#     .transpose("time", "y", "x", "channel")
+# )
+
+# print("Forcing type:", type(forcing_train))
+# print("Forcing dims:", forcing_train.dims)
+# print("Forcing shape:", forcing_train.shape)
+
+ssh_eval = ds_ocean["ssh"].sel(
+    time=slice(
+        "2023-01-01",
+        "2023-12-31",
+    )
+)
+
+# forcing_eval = ds_forcing.sel(
+#     time=slice(
+#         "2022-01-01",
+#         "2023-12-31",
+#     )
+# )
+
+ssh_test = ds_ocean["ssh"].sel(
+    time=slice(
+        "2024-01-01",
+        "2024-12-31",
+    )
+)
+
+# forcing_test = ds_forcing.sel(
+#     time=slice(
+#         "2023-01-01",
+#         "2024-12-31",
+#     )
+# )
+
+# forcing_eval = (
+#     forcing_eval[["u10", "v10", "msl"]]
+#     .to_array(dim="channel")
+#     .transpose("time", "y", "x", "channel")
+# )
 
 
-def load_trajectory(h5_file, key, start_ind, end_ind):
-    """Read snapshots [start_ind:end_ind] of one trajectory as (T, H, W)."""
-    data = np.asarray(h5_file[key]["data"][start_ind:end_ind], dtype=np.float64)
+# forcing_test = (
+#     forcing_test[["u10", "v10", "msl"]]
+#     .to_array(dim="channel")
+#     .transpose("time", "y", "x", "channel")
+# )
 
-    # PDEBench shallow water stores (T, H, W, 1): a single channel (water depth)
-    if data.ndim == 4:
-        if data.shape[-1] != 1:
-            raise ValueError(
-                f"Expected a single channel, got data of shape {data.shape}."
-            )
-        data = data[..., 0]
-
-    if data.ndim != 3:
-        raise ValueError(f"Expected (T, H, W) after squeezing, got {data.shape}.")
-    return data
+# print("Forcing type:", type(forcing_test))
+# print("Forcing dims:", forcing_test.dims)
+# print("Forcing shape:", forcing_test.shape)
 
 
-def compute_spline_coefficients(snapshots):
+
+print("Train:", ssh_train.shape)
+print("eval:", ssh_eval.shape)
+print("test:", ssh_test.shape)
+
+print(ssh_eval["time"].values)
+print(ssh_test["time"].values)
+
+
+print("Normalising the data!")
+
+def compute_forcing_stats(forcing, chunk_size=100):
     """
-    Fit a quintic spline through the time axis of (T, H, W) snapshots.
-
-    Returns
-    -------
-    coef : (T - 1, 6, H, W)
-    starts : (T - 1,)
-    ends : (T - 1,)
+    For computing the normalisation statistics
     """
-    n_snapshots = snapshots.shape[0]
-    if n_snapshots < 2:
-        raise ValueError("Need at least 2 snapshots to build a spline.")
+    n = forcing.shape[0]
 
-    t = np.arange(n_snapshots, dtype=np.float32)
+    sum_ = np.zeros(forcing.shape[-1], dtype=np.float64)
+    sum_sq = np.zeros(forcing.shape[-1], dtype=np.float64)
+    count = np.zeros(forcing.shape[-1], dtype=np.int64)
 
-    # quintic_spline_batch expects (B, T, H, W) and returns
-    # coeffs shaped like (n_segments, 6, H, W) for one trajectory.
+    for start in range(0, n, chunk_size):
+        end = min(start + chunk_size, n)
+
+        # Convert xarray chunk to NumPy
+        chunk = forcing.isel(time=slice(start, end)).values
+
+        for c in range(forcing.shape[-1]):
+            x = chunk[..., c]
+            valid = np.isfinite(x)
+
+            sum_[c] += np.sum(x[valid], dtype=np.float64)
+            sum_sq[c] += np.sum(x[valid] ** 2, dtype=np.float64)
+            count[c] += np.sum(valid)
+
+    mean = sum_ / count
+    variance = sum_sq / count - mean**2
+    std = np.sqrt(np.maximum(variance, 0.0))
+
+    return mean.astype(np.float32), std.astype(np.float32)
+
+def compute_ssh_stats(ssh, chunk_size=100):
+    """
+    Compute mean and standard deviation of SSH over the
+    training period, ignoring NaNs.
+    """
+
+    if ssh.ndim == 5 and ssh.shape[-1] == 1:
+        ssh = ssh.isel(channel=0)
+
+    if ssh.ndim != 3:
+        raise ValueError(
+            f"Expected SSH shape (time, Y, X), got {ssh.shape}"
+        )
+
+    n = ssh.shape[0]
+
+    sum_ = 0.0
+    sum_sq = 0.0
+    count = 0
+
+    for start in range(0, n, chunk_size):
+        end = min(start + chunk_size, n)
+
+        chunk = ssh.isel(time=slice(start, end)).values
+
+        valid = np.isfinite(chunk)
+        values = chunk[valid]
+
+        sum_ += np.sum(values, dtype=np.float64)
+        sum_sq += np.sum(values ** 2, dtype=np.float64)
+        count += values.size
+
+    mean = sum_ / count
+    variance = sum_sq / count - mean**2
+    std = np.sqrt(max(variance, 0.0))
+
+    return np.float32(mean), np.float32(std)
+
+#print(help(compute_ssh_stats))
+#print(compute_forcing_stats.__doc__)
+
+#Normalising on training statistics
+#mean_forcing, std_forcing = compute_forcing_stats(forcing_train)
+
+#print("Forcing mean:", mean_forcing)
+#print("Forcing std:", std_forcing)
+
+# Norm on training stats
+mean_state, std_state = compute_ssh_stats(ssh_train)
+
+print("SSH mean:", mean_state)
+print("SSH std:", std_state)
+
+ssh_train_std = (ssh_train - mean_state)/std_state
+ssh_eval_std = (ssh_eval - mean_state)/std_state
+ssh_test_std = (ssh_test - mean_state)/std_state
+
+print("Train mean:", ssh_train_std.mean(skipna=True).compute().item())
+print("Train std:", ssh_train_std.std(skipna=True).compute().item())
+
+print("Eval mean:", ssh_eval_std.mean(skipna=True).compute().item())
+print("Eval std:", ssh_eval_std.std(skipna=True).compute().item())
+
+print("Test mean:", ssh_test_std.mean(skipna=True).compute().item())
+print("Test std:", ssh_test_std.std(skipna=True).compute().item())
+
+# Mean: -5.601083685746744e-08
+# Std:  0.9999998807907104
+# Mean: 0.19018904864788055
+# Std:  1.0267821550369263
+# Mean: 0.14704376459121704
+# Std:  1.0457528829574585
+
+n_windows_train = len(
+        range(
+            0,
+            len(ssh_train) - trajectory_length + 1,
+            stride,
+        )
+    )
+
+n_windows_eval = len(
+        range(
+            0,
+            len(ssh_eval) - trajectory_length + 1,
+            stride,
+        )
+    )
+
+n_windows_test = len(
+        range(
+            0,
+            len(ssh_test) - trajectory_length + 1,
+            stride,
+        )
+    )
+
+print("Number of trajectories train: ", n_windows_train)
+print("Number of trajectories eval: ", n_windows_eval)
+print("Number of trajectories test: ", n_windows_test)
+
+
+def calculate_splines(
+    data,
+    trajectory_length,
+    stride,
+    output_path,
+    #mean_state,
+    #std_state
+):
+    """
+    For calculating spline coefficients and forcing at start of trajectories.
+    Inputs:
+        data (Xarray of shape (time, y, x)): 
+        trajectory length: the desired
+        stride: Defining the overlap
+        output_path: Where to save the trajectory data
+    Does:
+        Saves the trajectory data
+    """
+    # The number of trajectories (13896 - 49 + 1/49) is 283 for train
+    n_windows = len(
+        range(
+            0,
+            len(data) - trajectory_length + 1,
+            stride,
+        )
+    )
+
+
+    # --------------------------------------------------
+    # Determine spline dimensions using first trajectory
+    # --------------------------------------------------
+
+    trajectory = data.isel(
+        time=slice(0, trajectory_length)
+    )
+
+    mean_state, std_state = compute_ssh_stats(trajectory)
+
+    
+    x = trajectory.values.astype(np.float32)
+
+
+    #Normalize
+    x = (x - mean_state) / std_state
+
+
+    print(np.isnan(x).sum())
+
+    #Replace NaNs after normalization
+    x = np.nan_to_num(x, nan=0.0)
+
+
+    times = trajectory["time"].values
+    print(times[0])
+
+    times_hours = (
+        (times - times[0])
+        / np.timedelta64(1, "h")
+    ).astype(np.float32)
+
+    print(times_hours[0])
+
     coeffs, starts, ends = quintic_spline_batch(
-        snapshots[None, ...].astype(np.float32),
-        time=t[None, :],
+        x[None, ...],
+        time=times_hours[None, :],
         batch_size=1,
         num_point=3,
         device="cpu",
     )
 
-    # flatten the leading batch dimension
-    coef = coeffs.reshape(n_snapshots - 1, N_COEFFICIENTS, *snapshots.shape[1:])
-    return coef.astype(np.float32), starts.astype(np.float32), ends.astype(np.float32)
 
+    n_segments, n_coefficients, ny, nx = coeffs.shape
 
-def make_array(root, name, shape, chunks, dtype):
-    """Create a Zarr array on both zarr v2 and v3."""
-    if hasattr(root, "create_array"):
-        return root.create_array(name, shape=shape, chunks=chunks, dtype=dtype)
-    return root.create_dataset(name, shape=shape, chunks=chunks, dtype=dtype)
+    print("Spline coefficient shape:", coeffs.shape)
 
+    # --------------------------------------------------
+    # Create Zarr store
+    # --------------------------------------------------
 
-def main():
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--h5-path", default="data/shallow_water/2D_rdb_NA_NA.h5")
-    parser.add_argument("--zarr-path", default="processed/shallow_water/splines_quintic.zarr")
-    parser.add_argument("--training-ratio", type=float, default=9 / 10)
-    parser.add_argument("--random-seed", type=int, default=42)
-    parser.add_argument("--start-ind", type=int, default=1)
-    parser.add_argument("--end-ind", type=int, default=101)
-    args = parser.parse_args()
+    root = zarr.open_group(
+        output_path,
+        mode="w",
+    )
+    
+    z_coeffs = root.create_array(
+        "spline_coef",
+        shape=(
+            n_windows,
+            n_segments,
+            n_coefficients,
+            ny,
+            nx,
+        ),
+        chunks=(
+            1,
+            n_segments,
+            n_coefficients,
+            ny,
+            nx,
+        ),
+        dtype=np.float32,
+    )
 
-    logging.basicConfig(level=logging.INFO, format="%(message)s")
+    z_starts = root.create_array(
+        "spline_start",
+        shape=(
+            n_windows,
+            n_segments,
+        ),
+        chunks=(
+            1,
+            n_segments,
+        ),
+        dtype=np.float32,
+    )
 
-    with h5py.File(args.h5_path, "r") as h5_file:
-        keys = list(h5_file.keys())
-        n_trajectories = len(keys)
+    z_ends = root.create_array(
+        "spline_end",
+        shape=(
+            n_windows,
+            n_segments,
+        ),
+        chunks=(
+            1,
+            n_segments,
+        ),
+        dtype=np.float32,
+    )
 
-        first = load_trajectory(h5_file, keys[0], args.start_ind, args.end_ind)
-        n_snapshots, height, width = first.shape
-        n_intervals = n_snapshots - 1
+    z_t_start = root.create_array(
+        "t_start",
+        shape=(n_windows,),
+        chunks=(1,),
+        dtype="datetime64[ns]",
+    )
 
-        logger.info(
-            "Found %d trajectories with %d snapshots on a %d x %d grid "
-            "-> %d spline intervals each.",
-            n_trajectories,
-            n_snapshots,
-            height,
-            width,
-            n_intervals,
+    z_t_end = root.create_array(
+        "t_end",
+        shape=(n_windows,),
+        chunks=(1,),
+        dtype="datetime64[ns]",
+    )
+
+    
+    # --------------------------------------------------
+    # Loop over trajectories
+    # --------------------------------------------------
+
+    for i, start in enumerate(
+        range(
+            0,
+            len(data) - trajectory_length + 1,
+            stride,
+        )
+    ):
+
+        print(
+            f"Trajectory {i + 1}/{n_windows}"
         )
 
-        root = zarr.open_group(args.zarr_path, mode="w")
+        # ----------------------------------------------
+        # SSH trajectory
+        # ----------------------------------------------
 
-        coef_array = make_array(
-            root,
-            "spline_coef",
-            shape=(n_trajectories, n_intervals, N_COEFFICIENTS, height, width),
-            chunks=(1, 1, N_COEFFICIENTS, height, width),
-            dtype="float32",
-        )
-
-        # Knot times are identical for all trajectories.
-        # Keep the same convention as the rest of the project: local times
-        # run 0, 1, ..., n_intervals-1 at the interval starts.
-        t_start = np.broadcast_to(
-            np.arange(n_intervals, dtype=np.float32),
-            (n_trajectories, n_intervals),
-        )
-        t_end = t_start + 1.0
-
-        for name, values in (("spline_start", t_start), ("spline_end", t_end)):
-            array = make_array(
-                root,
-                name,
-                shape=(n_trajectories, n_intervals),
-                chunks=(n_trajectories, n_intervals),
-                dtype="float32",
+        trajectory = data.isel(
+            time=slice(
+                start,
+                start + trajectory_length,
             )
-            array[:] = values
+        )
 
-        for i, key in enumerate(keys):
-            snapshots = first if i == 0 else load_trajectory(
-                h5_file, key, args.start_ind, args.end_ind
-            )
+        x = trajectory.values.astype(
+            np.float32
+        )
 
-            coef, starts, ends = compute_spline_coefficients(snapshots)
+        # Normalize using TRAIN statistics
+        x = (
+            x - mean_state
+        ) / std_state
 
-            if i == 0:
-                # At the end of each interval, the spline should reproduce the next snapshot.
-                reconstructed = coef.sum(axis=1)  # (n_intervals, H, W)
-                error = np.abs(reconstructed - snapshots[1:]).max()
-                logger.info("Max knot reconstruction error (traj 0): %.3e", error)
+        # Land → zero
+        x = np.nan_to_num(
+            x,
+            nan=0.0,
+        )
 
-            coef_array[i] = coef
+        
 
-            if (i + 1) % 50 == 0 or i + 1 == n_trajectories:
-                logger.info("  processed %d / %d", i + 1, n_trajectories)
+        times = trajectory["time"].values
 
-    np.random.seed(args.random_seed)
-    indices = np.arange(n_trajectories)
-    np.random.shuffle(indices)
-    train_size = int(args.training_ratio * n_trajectories)
+        times_hours = (
+            (times - times[0])
+            / np.timedelta64(1, "h")
+        ).astype(np.float32)
 
-    root.attrs["train_indices"] = indices[:train_size].tolist()
-    root.attrs["test_indices"] = indices[train_size:].tolist()
-    root.attrs["bc_type"] = "quintic-project-spline"
-    root.attrs["coefficient_order"] = "ascending powers of (t - t_start); quintic"
+        
 
-    logger.info(
-        "Wrote %s (train: %d, test: %d trajectories)",
-        args.zarr_path,
-        train_size,
-        n_trajectories - train_size,
+        # ----------------------------------------------
+        # Calculate spline
+        # ----------------------------------------------
+
+        coeffs, starts, ends = quintic_spline_batch(
+            x[None, ...],
+            time=times_hours[None, :],
+            batch_size=1,
+            num_point=3,
+            device="cpu",
+        )
+
+        # ----------------------------------------------
+        # Save spline
+        # ----------------------------------------------
+
+        duration_hours = times_hours[-1] - times_hours[0]
+        
+        if duration_hours <= 0:
+            raise ValueError(f"Invalid trajectory duration: {duration_hours}")
+
+        z_coeffs[i] = coeffs
+        z_starts[i] = starts / (duration_hours)
+        z_ends[i] = ends / (duration_hours)
+
+        
+        # ----------------------------------------------
+        # Absolute trajectory times
+        # ----------------------------------------------
+
+        z_t_start[i] = (
+            data.time.isel(
+                time=start
+            ).values
+        )
+
+        z_t_end[i] = (
+            data.time.isel(
+                time=start + trajectory_length - 1
+            ).values
+        )
+
+    
+
+    print(
+        f"Saved splines to {output_path}"
     )
 
 
-if __name__ == "__main__":
-    main()
+
+
+# ---------------------------------------------------------
+# Calculate splines
+# ---------------------------------------------------------
+start_time = time.time()
+
+calculate_splines(
+    ssh_train,
+    trajectory_length=trajectory_length,
+    stride=stride,
+    output_path=f"./{OUTPUT_DIR}/splines_train_state.zarr",
+)
+
+calculate_splines(
+    ssh_eval,
+    trajectory_length=trajectory_length,
+    stride=stride,
+    output_path=f"./{OUTPUT_DIR}/splines_eval_state.zarr",
+)
+
+calculate_splines(
+    ssh_test,
+    trajectory_length=trajectory_length,
+    stride=stride,
+    output_path=f"./{OUTPUT_DIR}/splines_test_state.zarr",
+)
+
+end_time = time.time()
+
+print(f"Time taken to calculate splines: {(end_time - start_time)/60} minutes")
